@@ -144,6 +144,7 @@ export class GameRoom {
   }
 
   async _resolveBidsIfNeeded() {
+    if (this.room.phase !== 'BIDDING') return;
     const now = this._now();
     const players = this.room.players.map(p => p.id);
     const bothBid = players.every(id => !!this.room.bids[id]);
