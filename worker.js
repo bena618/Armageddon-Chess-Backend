@@ -5,6 +5,20 @@ export class GameRoom {
     this.room = null;
   }
 
+  _corsHeaders() {
+    return {
+      "Access-Control-Allow-Origin": (this.env && this.env.FRONTEND_URL) || "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+  }
+
+  _response(body = null, status = 200, extra = {}) {
+    const headers = Object.assign({}, this._corsHeaders(), extra);
+    if (status === 204) return new Response(null, { status, headers });
+    return new Response(JSON.stringify(body), { status, headers });
+  }
+
   async _load() {
     if (this.room) return;
     const stored = await this.state.storage.get('room');
@@ -49,6 +63,7 @@ export class GameRoom {
 
   async fetch(request) {
     await this._load();
+    if (request.method === 'OPTIONS') return this._response(null, 204);
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/\/+/g, '/');
     try {
@@ -59,14 +74,14 @@ export class GameRoom {
       if (path === '/chooseColor' && request.method === 'POST') return this._handleChooseColor(request);
       if (path === '/makeMove' && request.method === 'POST') return this._handleMakeMove(request);
       if (path === '/getState' && request.method === 'GET') return this._handleGetState();
-      return new Response(JSON.stringify({ error: 'not_found' }), { status: 404 });
+      return this._response({ error: 'not_found' }, 404);
     } catch (err) {
-      return new Response(JSON.stringify({ error: err?.message || String(err) }), { status: 400 });
+      return this._response({ error: err?.message || String(err) }, 400);
     }
   }
 
   async _handleInit(request) {
-    if (this.room?.roomId) return new Response(JSON.stringify({ error: 'already_initialized' }), { status: 400 });
+    if (this.room?.roomId) return this._response({ error: 'already_initialized' }, 400);
     const body = await request.json();
     const now = this._now();
     this.room.roomId = body.roomId || `room-${crypto.randomUUID()}`;
@@ -77,24 +92,24 @@ export class GameRoom {
     this.room.createdAt = now;
     this.room.phase = 'LOBBY';
     await this._save();
-    return new Response(JSON.stringify({ ok: true, roomId: this.room.roomId }));
+    return this._response({ ok: true, roomId: this.room.roomId });
   }
 
   async _handleJoin(request) {
     const body = await request.json();
     const { playerId, name } = body;
-    if (!playerId) return new Response(JSON.stringify({ error: 'playerId_required' }), { status: 400 });
-    if (this.room.phase !== 'LOBBY') return new Response(JSON.stringify({ error: 'not_in_lobby' }), { status: 400 });
-    if (this.room.players.find(p => p.id === playerId)) return new Response(JSON.stringify({ ok: true, room: this.room }));
-    if (this.room.players.length >= this.room.maxPlayers) return new Response(JSON.stringify({ error: 'room_full' }), { status: 400 });
+    if (!playerId) return this._response({ error: 'playerId_required' }, 400);
+    if (this.room.phase !== 'LOBBY') return this._response({ error: 'not_in_lobby' }, 400);
+    if (this.room.players.find(p => p.id === playerId)) return this._response({ ok: true, room: this.room });
+    if (this.room.players.length >= this.room.maxPlayers) return this._response({ error: 'room_full' }, 400);
     this.room.players.push({ id: playerId, name: name || null, joinedAt: this._now() });
     await this._save();
-    return new Response(JSON.stringify({ ok: true, room: this.room }));
+    return this._response({ ok: true, room: this.room });
   }
 
   async _handleStartBidding(request) {
-    if (this.room.phase !== 'LOBBY') return new Response(JSON.stringify({ error: 'invalid_phase' }), { status: 400 });
-    if (this.room.players.length !== this.room.maxPlayers) return new Response(JSON.stringify({ error: 'need_more_players' }), { status: 400 });
+    if (this.room.phase !== 'LOBBY') return this._response({ error: 'invalid_phase' }, 400);
+    if (this.room.players.length !== this.room.maxPlayers) return this._response({ error: 'need_more_players' }, 400);
     const now = this._now();
     this.room.phase = 'BIDDING';
     this.room.bidDeadline = now + this.room.bidDurationMs;
@@ -105,27 +120,27 @@ export class GameRoom {
     this.room.losingBidMs = null;
     this.room.drawOddsSide = null;
     await this._save();
-    return new Response(JSON.stringify({ ok: true, bidDeadline: this.room.bidDeadline }));
+    return this._response({ ok: true, bidDeadline: this.room.bidDeadline });
   }
 
   async _handleSubmitBid(request) {
     const body = await request.json();
     const { playerId, amount } = body;
-    if (this.room.phase !== 'BIDDING') return new Response(JSON.stringify({ error: 'not_bidding' }), { status: 400 });
-    if (!playerId || typeof amount !== 'number') return new Response(JSON.stringify({ error: 'playerId_and_amount_required' }), { status: 400 });
-    if (!this.room.players.find(p => p.id === playerId)) return new Response(JSON.stringify({ error: 'unknown_player' }), { status: 400 });
+    if (this.room.phase !== 'BIDDING') return this._response({ error: 'not_bidding' }, 400);
+    if (!playerId || typeof amount !== 'number') return this._response({ error: 'playerId_and_amount_required' }, 400);
+    if (!this.room.players.find(p => p.id === playerId)) return this._response({ error: 'unknown_player' }, 400);
 
     const now = this._now();
     if (this.room.bidDeadline && now > this.room.bidDeadline) {
       await this._resolveBidsIfNeeded();
-      return new Response(JSON.stringify({ error: 'bidding_closed' }), { status: 400 });
+      return this._response({ error: 'bidding_closed' }, 400);
     }
-    if (this.room.bids[playerId]) return new Response(JSON.stringify({ error: 'already_bid' }), { status: 400 });
+    if (this.room.bids[playerId]) return this._response({ error: 'already_bid' }, 400);
 
     this.room.bids[playerId] = { amount, submittedAt: now };
     await this._save();
     await this._resolveBidsIfNeeded();
-    return new Response(JSON.stringify({ ok: true }));
+    return this._response({ ok: true });
   }
 
   async _resolveBidsIfNeeded() {
@@ -162,12 +177,12 @@ export class GameRoom {
   async _handleChooseColor(request) {
     const body = await request.json();
     const { playerId, color } = body;
-    if (this.room.phase !== 'COLOR_PICK') return new Response(JSON.stringify({ error: 'not_in_color_pick' }), { status: 400 });
-    if (playerId !== this.room.winnerId) return new Response(JSON.stringify({ error: 'not_winner' }), { status: 400 });
-    if (!['white', 'black'].includes(color)) return new Response(JSON.stringify({ error: 'invalid_color' }), { status: 400 });
+    if (this.room.phase !== 'COLOR_PICK') return this._response({ error: 'not_in_color_pick' }, 400);
+    if (playerId !== this.room.winnerId) return this._response({ error: 'not_winner' }, 400);
+    if (!['white', 'black'].includes(color)) return this._response({ error: 'invalid_color' }, 400);
 
     const now = this._now();
-    if (this.room.choiceDeadline && now > this.room.choiceDeadline) return new Response(JSON.stringify({ error: 'choice_deadline_passed' }), { status: 400 });
+    if (this.room.choiceDeadline && now > this.room.choiceDeadline) return this._response({ error: 'choice_deadline_passed' }, 400);
 
     const other = this.room.players.find(p => p.id !== playerId)?.id || null;
     this.room.colors = { [playerId]: color };
@@ -186,17 +201,17 @@ export class GameRoom {
     };
     this.room.phase = 'PLAYING';
     await this._save();
-    return new Response(JSON.stringify({ ok: true, clocks: this.room.clocks }));
+    return this._response({ ok: true, clocks: this.room.clocks });
   }
 
   async _handleMakeMove(request) {
     const body = await request.json();
     const { playerId, move } = body;
-    if (this.room.phase !== 'PLAYING') return new Response(JSON.stringify({ error: 'not_playing' }), { status: 400 });
+    if (this.room.phase !== 'PLAYING') return this._response({ error: 'not_playing' }, 400);
 
     const playerColor = this.room.colors[playerId];
-    if (!playerColor) return new Response(JSON.stringify({ error: 'unknown_player_color' }), { status: 400 });
-    if (playerColor !== this.room.clocks.turn) return new Response(JSON.stringify({ error: 'not_your_turn' }), { status: 400 });
+    if (!playerColor) return this._response({ error: 'unknown_player_color' }, 400);
+    if (playerColor !== this.room.clocks.turn) return this._response({ error: 'not_your_turn' }, 400);
 
     const now = this._now();
     const elapsed = now - (this.room.clocks.lastTickAt || now);
@@ -209,26 +224,32 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = winnerId;
       await this._save();
-      return new Response(JSON.stringify({ ok: true, result: 'time_forfeit', winnerId }));
+      return this._response({ ok: true, result: 'time_forfeit', winnerId });
     }
 
     this.room.moves.push({ by: playerId, move, at: now });
     this.room.clocks.lastTickAt = now;
     this.room.clocks.turn = this.room.clocks.turn === 'white' ? 'black' : 'white';
     await this._save();
-    return new Response(JSON.stringify({ ok: true, clocks: this.room.clocks, moves: this.room.moves }));
+    return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
   }
 
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
-    return new Response(JSON.stringify({ ok: true, room: this.room }));
+    return this._response({ ok: true, room: this.room });
   }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const segments = url.pathname.replace(/(^\/|\/$)/g, '').split('/');
+    const segments = url.pathname.replace(/(^\/|\/\$)/g, '').split('/');
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': env && env.FRONTEND_URL ? env.FRONTEND_URL : '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    };
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
 
     try {
       if (request.method === 'POST' && url.pathname === '/rooms') {
@@ -249,7 +270,7 @@ export default {
         });
         const res = await obj.fetch(initReq);
         const data = await res.json();
-        return new Response(JSON.stringify({ ok: true, roomId, meta: data }), { headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ ok: true, roomId, meta: data }), { headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) });
       }
 
       if (segments[0] === 'rooms' && segments[1]) {
@@ -258,16 +279,35 @@ export default {
         const obj = env.GAME_ROOMS.get(id);
 
         if (segments.length === 2 && request.method === 'GET') return obj.fetch(new Request('https://do/getState'));
-        if (segments.length === 3 && segments[2] === 'join' && request.method === 'POST') return obj.fetch(new Request('https://do/joinRoom', request));
-        if (segments.length === 3 && segments[2] === 'start-bidding' && request.method === 'POST') return obj.fetch(new Request('https://do/startBidding', request));
-        if (segments.length === 3 && segments[2] === 'submit-bid' && request.method === 'POST') return obj.fetch(new Request('https://do/submitBid', request));
-        if (segments.length === 3 && segments[2] === 'choose-color' && request.method === 'POST') return obj.fetch(new Request('https://do/chooseColor', request));
-        if (segments.length === 3 && segments[2] === 'move' && request.method === 'POST') return obj.fetch(new Request('https://do/makeMove', request));
+        if (segments.length === 3 && segments[2] === 'join' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/joinRoom', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'start-bidding' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/startBidding', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'submit-bid' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/submitBid', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'choose-color' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/chooseColor', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'move' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/makeMove', { method: 'POST', headers, body: bodyText }));
+        }
       }
-
-      return new Response(JSON.stringify({ error: 'route_not_found' }), { status: 404 });
+      return new Response(JSON.stringify({ error: 'route_not_found' }), { status: 404, headers: corsHeaders });
     } catch (err) {
-      return new Response(JSON.stringify({ error: err?.message || String(err) }), { status: 500 });
+      return new Response(JSON.stringify({ error: err?.message || String(err) }), { status: 500, headers: corsHeaders });
     }
   }
 };
