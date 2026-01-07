@@ -1,7 +1,6 @@
 name = "armageddon-chess"
 main = "worker.js"
 compatibility_date = "2026-01-06"
-type = "javascript"
 
 [durable_objects]
 bindings = [
