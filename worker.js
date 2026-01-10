@@ -1,3 +1,5 @@
+import { Chess } from 'chess.js';
+
 export class GameRoom {
   constructor(state, env) {
     this.state = state;
@@ -44,6 +46,8 @@ export class GameRoom {
       colors: {},
       clocks: null,
       moves: [],
+      choiceAttempts: 0,
+      currentPicker: null,
       createdAt: now,
       updatedAt: now,
       bidDurationMs: 10000,
@@ -119,6 +123,8 @@ export class GameRoom {
     this.room.winningBidMs = null;
     this.room.losingBidMs = null;
     this.room.drawOddsSide = null;
+    this.room.choiceAttempts = 0;
+    this.room.currentPicker = null;
     await this._save();
     return this._response({ ok: true, bidDeadline: this.room.bidDeadline });
   }
@@ -129,6 +135,10 @@ export class GameRoom {
     if (this.room.phase !== 'BIDDING') return this._response({ error: 'not_bidding' }, 400);
     if (!playerId || typeof amount !== 'number') return this._response({ error: 'playerId_and_amount_required' }, 400);
     if (!this.room.players.find(p => p.id === playerId)) return this._response({ error: 'unknown_player' }, 400);
+
+    if (typeof this.room.mainTimeMs === 'number' && (amount < 0 || amount > this.room.mainTimeMs)) {
+      return this._response({ error: 'invalid_bid_amount' }, 400);
+    }
 
     const now = this._now();
     if (this.room.bidDeadline && now > this.room.bidDeadline) {
@@ -151,6 +161,14 @@ export class GameRoom {
     const deadlinePassed = this.room.bidDeadline && now > this.room.bidDeadline;
     if (!bothBid && !deadlinePassed) return;
 
+    if (deadlinePassed) {
+      for (const pid of players) {
+        if (!this.room.bids[pid]) {
+          this.room.bids[pid] = { amount: this.room.mainTimeMs, submittedAt: now };
+        }
+      }
+    }
+
     const entries = Object.entries(this.room.bids || {});
     if (entries.length === 0) {
       this.room.winnerId = players[0] || null;
@@ -163,14 +181,24 @@ export class GameRoom {
         if (aobj.submittedAt !== bobj.submittedAt) return aobj.submittedAt - bobj.submittedAt;
         return aid.localeCompare(bid);
       });
+
+      if (entries.length > 1 && entries[0][1].amount === entries[1][1].amount) {
+        this.room.bids = {};
+        this.room.bidDeadline = now + this.room.bidDurationMs;
+        await this._save();
+        return;
+      }
+
       this.room.winnerId = entries[0][0];
       this.room.loserId = entries.length > 1 ? entries[1][0] : players.find(p => p !== this.room.winnerId) || null;
       this.room.winningBidMs = entries[0][1].amount;
       this.room.losingBidMs = entries.length > 1 ? entries[1][1].amount : null;
     }
 
-    this.room.drawOddsSide = this.room.winnerId;
+    this.room.drawOddsSide = null;
     this.room.phase = 'COLOR_PICK';
+    this.room.choiceAttempts = 0;
+    this.room.currentPicker = 'winner';
     this.room.choiceDeadline = now + this.room.choiceDurationMs;
     await this._save();
   }
@@ -179,10 +207,11 @@ export class GameRoom {
     const body = await request.json();
     const { playerId, color } = body;
     if (this.room.phase !== 'COLOR_PICK') return this._response({ error: 'not_in_color_pick' }, 400);
-    if (playerId !== this.room.winnerId) return this._response({ error: 'not_winner' }, 400);
+    const now = this._now();
+    const allowedRole = this.room.currentPicker === 'winner' ? this.room.winnerId : this.room.loserId;
+    if (playerId !== allowedRole) return this._response({ error: 'not_allowed_to_choose' }, 400);
     if (!['white', 'black'].includes(color)) return this._response({ error: 'invalid_color' }, 400);
 
-    const now = this._now();
     if (this.room.choiceDeadline && now > this.room.choiceDeadline) return this._response({ error: 'choice_deadline_passed' }, 400);
 
     const other = this.room.players.find(p => p.id !== playerId)?.id || null;
@@ -200,9 +229,29 @@ export class GameRoom {
       lastTickAt: now,
       turn: 'white'
     };
+    const blackPlayerId = Object.keys(this.room.colors).find(id => this.room.colors[id] === 'black') || null;
+    this.room.drawOddsSide = blackPlayerId;
     this.room.phase = 'PLAYING';
     await this._save();
     return this._response({ ok: true, clocks: this.room.clocks });
+  }
+
+  async _resolveChoiceIfNeeded() {
+    if (this.room.phase !== 'COLOR_PICK') return;
+    const now = this._now();
+    if (!this.room.choiceDeadline || now <= this.room.choiceDeadline) return;
+
+    this.room.choiceAttempts = (this.room.choiceAttempts || 0) + 1;
+    if (this.room.choiceAttempts >= 4) {
+      this.room.phase = 'FINISHED';
+      this.room.winnerId = null;
+      await this._save();
+      return;
+    }
+
+    this.room.currentPicker = this.room.currentPicker === 'winner' ? 'loser' : 'winner';
+    this.room.choiceDeadline = now + this.room.choiceDurationMs;
+    await this._save();
   }
 
   async _handleMakeMove(request) {
@@ -228,15 +277,54 @@ export class GameRoom {
       return this._response({ ok: true, result: 'time_forfeit', winnerId });
     }
 
+    const game = new Chess();
+    if (this.room.moves && this.room.moves.length > 0) {
+      for (const m of this.room.moves) {
+        try {
+          if (typeof m.move === 'string' && m.move.length >= 4) {
+            const from = m.move.slice(0,2);
+            const to = m.move.slice(2,4);
+            const promotion = m.move.length >= 5 ? m.move[4] : undefined;
+            if (promotion) game.move({ from, to, promotion });
+            else game.move({ from, to });
+          } else {
+            game.move(m.move);
+          }
+        } catch (e) {}
+      }
+    }
+
+    if (typeof move !== 'string' || move.length < 4) return this._response({ error: 'invalid_move_format' }, 400);
+    const from = move.slice(0,2);
+    const to = move.slice(2,4);
+    const promotion = move.length >= 5 ? move[4] : undefined;
+
+    const test = new Chess(game.fen());
+    const moved = test.move({ from, to, promotion: promotion || 'q' });
+    if (!moved) return this._response({ error: 'illegal_move' }, 400);
+
     this.room.moves.push({ by: playerId, move, at: now });
     this.room.clocks.lastTickAt = now;
     this.room.clocks.turn = this.room.clocks.turn === 'white' ? 'black' : 'white';
+
+    const after = new Chess(game.fen());
+    after.move({ from, to, promotion: promotion || 'q' });
+    const isCheckmate = (after.isCheckmate && typeof after.isCheckmate === 'function' && after.isCheckmate()) ||
+                        (after.in_checkmate && typeof after.in_checkmate === 'function' && after.in_checkmate());
+    if (isCheckmate) {
+      this.room.phase = 'FINISHED';
+      this.room.winnerId = playerId;
+      await this._save();
+      return this._response({ ok: true, result: 'checkmate', winnerId: playerId, clocks: this.room.clocks, moves: this.room.moves });
+    }
+
     await this._save();
     return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
   }
 
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
+    await this._resolveChoiceIfNeeded();
     return this._response({ ok: true, room: this.room });
   }
 }
