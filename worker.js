@@ -174,21 +174,48 @@ export class GameRoom {
   }
 
   async _handleStartBidding(request) {
+    // Two-step start: first press requests bidding start, other player must confirm within choiceDurationMs (default 60s)
+    const body = await request.json().catch(() => ({}));
+    const { playerId } = body;
+    if (!playerId) return this._response({ error: 'playerId_required' }, 400);
     if (this.room.phase !== 'LOBBY') return this._response({ error: 'invalid_phase' }, 400);
     if (this.room.players.length !== this.room.maxPlayers) return this._response({ error: 'need_more_players' }, 400);
     const now = this._now();
-    this.room.phase = 'BIDDING';
-    this.room.bidDeadline = now + this.room.bidDurationMs;
-    this.room.bids = {};
-    this.room.winnerId = null;
-    this.room.loserId = null;
-    this.room.winningBidMs = null;
-    this.room.losingBidMs = null;
-    this.room.drawOddsSide = null;
-    this.room.choiceAttempts = 0;
-    this.room.currentPicker = null;
+
+    // if there's already a pending start request
+    if (this.room.startRequestedBy && this.room.startConfirmDeadline) {
+      // if same player presses again, ignore
+      if (this.room.startRequestedBy === playerId) return this._response({ ok: true, message: 'already_requested' });
+      // if within deadline, begin bidding
+      if (now <= this.room.startConfirmDeadline) {
+        this.room.phase = 'BIDDING';
+        this.room.bidDeadline = now + this.room.bidDurationMs;
+        this.room.bids = {};
+        this.room.winnerId = null;
+        this.room.loserId = null;
+        this.room.winningBidMs = null;
+        this.room.losingBidMs = null;
+        this.room.drawOddsSide = null;
+        this.room.choiceAttempts = 0;
+        this.room.currentPicker = null;
+        // clear start request
+        this.room.startRequestedBy = null;
+        this.room.startConfirmDeadline = null;
+        await this._save();
+        return this._response({ ok: true, bidDeadline: this.room.bidDeadline });
+      }
+      // deadline passed - clear and revert
+      this.room.startRequestedBy = null;
+      this.room.startConfirmDeadline = null;
+      await this._save();
+      return this._response({ error: 'start_request_expired' }, 400);
+    }
+
+    // create a start request and set a confirm deadline
+    this.room.startRequestedBy = playerId;
+    this.room.startConfirmDeadline = now + (this.room.choiceDurationMs || 60 * 1000);
     await this._save();
-    return this._response({ ok: true, bidDeadline: this.room.bidDeadline });
+    return this._response({ ok: true, startRequestedBy: playerId, startConfirmDeadline: this.room.startConfirmDeadline });
   }
 
   async _handleSubmitBid(request) {
@@ -390,6 +417,15 @@ export class GameRoom {
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
+    // expire pending start-bidding requests
+    const now = this._now();
+    if (this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
+      this.room.startRequestedBy = null;
+      this.room.startConfirmDeadline = null;
+      this.room.phase = 'LOBBY';
+      this.room.closed = true;
+      await this._save();
+    }
     // cleanup rematch window expiry and possibly mark room removable
     if (this.room.phase === 'FINISHED' && this.room.rematchWindowEnds && this._now() > this.room.rematchWindowEnds) {
       // if rematchVotes do not indicate unanimous agreement, remove index entry
