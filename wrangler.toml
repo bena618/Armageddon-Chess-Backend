@@ -1,6 +1,6 @@
 name = "armageddon-chess"
 main = "worker.js"
-compatibility_date = "2026-01-07"
+compatibility_date = "2026-01-11"
 
 [durable_objects]
 bindings = [
@@ -9,10 +9,5 @@ bindings = [
 ]
 
 [[migrations]]
-tag = "v1"
-new_sqlite_classes = ["GameRoom"]
-new_durable_objects = ["GameRoom"]
-
-[[migrations]]
 tag = "v2"
-new_durable_objects = ["RoomIndex"]
+new_sqlite_classes = ["GameRoom", "RoomIndex"]
