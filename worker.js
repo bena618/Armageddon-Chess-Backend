@@ -5,7 +5,6 @@ export class GameRoom {
     this.state = state;
     this.env = env;
     this.room = null;
-    this.sessions = new Map();
   }
 
   _corsHeaders() {
@@ -92,23 +91,34 @@ export class GameRoom {
   _handleWebSocket(request) {
     const url = new URL(request.url);
     const playerId = url.searchParams.get('playerId');
-    if (!playerId || !this.room?.players?.find(p => p.id === playerId)) {
-      return this._response({ error: 'invalid_player' }, 403);
+    if (!playerId) {
+      return this._response({ error: 'playerId_required' }, 400);
     }
-    const { 0: client, 1: server } = new WebSocketPair();
+
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+
     server.accept();
-    this.sessions.set(playerId, server);
-    server.addEventListener('close', () => this.sessions.delete(playerId));
+    server.serializeAttachment({ playerId });  // Store playerId for identification on wake-up
+
+    // Send initial state immediately
     server.send(JSON.stringify({ type: 'init', room: this.room }));
+
+    // No need for manual close listener - runtime handles hibernation
     return new Response(null, { status: 101, webSocket: client });
   }
 
   _broadcastUpdate() {
-    if (!this.sessions.size) return;
+    const websockets = this.state.getWebSockets();
+    if (websockets.length === 0) return;
+
     const msg = JSON.stringify({ type: 'update', room: this.room });
-    for (const ws of this.sessions.values()) {
+
+    for (const ws of websockets) {
       try {
-        ws.send(msg);
+        if (ws.readyState === 1) {  // OPEN
+          ws.send(msg);
+        }
       } catch {}
     }
   }
