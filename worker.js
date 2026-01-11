@@ -5,6 +5,7 @@ export class GameRoom {
     this.state = state;
     this.env = env;
     this.room = null;
+    this.sessions = new Map();
   }
 
   _corsHeaders() {
@@ -59,6 +60,7 @@ export class GameRoom {
   async _save() {
     this.room.updatedAt = Date.now();
     await this.state.storage.put('room', this.room);
+    this._broadcastUpdate();
   }
 
   _now() {
@@ -67,6 +69,9 @@ export class GameRoom {
 
   async fetch(request) {
     await this._load();
+    if (request.headers.get('Upgrade') === 'websocket') {
+      return this._handleWebSocket(request);
+    }
     if (request.method === 'OPTIONS') return this._response(null, 204);
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/\/+/g, '/');
@@ -81,6 +86,30 @@ export class GameRoom {
       return this._response({ error: 'not_found' }, 404);
     } catch (err) {
       return this._response({ error: err?.message || String(err) }, 400);
+    }
+  }
+
+  _handleWebSocket(request) {
+    const url = new URL(request.url);
+    const playerId = url.searchParams.get('playerId');
+    if (!playerId || !this.room?.players?.find(p => p.id === playerId)) {
+      return this._response({ error: 'invalid_player' }, 403);
+    }
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.accept();
+    this.sessions.set(playerId, server);
+    server.addEventListener('close', () => this.sessions.delete(playerId));
+    server.send(JSON.stringify({ type: 'init', room: this.room }));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  _broadcastUpdate() {
+    if (!this.sessions.size) return;
+    const msg = JSON.stringify({ type: 'update', room: this.room });
+    for (const ws of this.sessions.values()) {
+      try {
+        ws.send(msg);
+      } catch {}
     }
   }
 
@@ -332,7 +361,7 @@ export class GameRoom {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const segments = url.pathname.replace(/(^\/|\/\$)/g, '').split('/');
+    const segments = url.pathname.replace(/(^\/|\/$)/g, '').split('/');
     const corsHeaders = {
       'Access-Control-Allow-Origin': env && env.FRONTEND_URL ? env.FRONTEND_URL : '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -366,6 +395,10 @@ export default {
         const roomId = segments[1];
         const id = env.GAME_ROOMS.idFromName(roomId);
         const obj = env.GAME_ROOMS.get(id);
+
+        if (url.pathname.endsWith('/ws') && request.headers.get('Upgrade') === 'websocket') {
+          return obj.fetch(request);
+        }
 
         if (segments.length === 2 && request.method === 'GET') return obj.fetch(new Request('https://do/getState'));
         if (segments.length === 3 && segments[2] === 'join' && request.method === 'POST') {
