@@ -98,6 +98,7 @@ export class GameRoom {
       if (path === '/submitBid' && request.method === 'POST') return this._handleSubmitBid(request);
       if (path === '/chooseColor' && request.method === 'POST') return this._handleChooseColor(request);
       if (path === '/makeMove' && request.method === 'POST') return this._handleMakeMove(request);
+      if (path === '/rematch' && request.method === 'POST') return this._handleRematch(request);
       if (path === '/getState' && request.method === 'GET') return this._handleGetState();
       return this._response({ error: 'not_found' }, 404);
     } catch (err) {
@@ -402,6 +403,44 @@ export class GameRoom {
     }
     return this._response({ ok: true, room: this.room });
   }
+
+  async _handleRematch(request) {
+    const body = await request.json().catch(() => ({}));
+    const { playerId, agree } = body;
+    if (!playerId) return this._response({ error: 'playerId_required' }, 400);
+    if (this.room.phase !== 'FINISHED') return this._response({ error: 'not_finished' }, 400);
+    if (!this.room.rematchWindowEnds || this._now() > this.room.rematchWindowEnds) return this._response({ error: 'rematch_window_closed' }, 400);
+
+    this.room.rematchVotes = this.room.rematchVotes || {};
+    this.room.rematchVotes[playerId] = !!agree;
+    await this._save();
+
+    const players = (this.room.players || []).map(p => p.id);
+    const allAgreed = players.length > 0 && players.every(pid => this.room.rematchVotes[pid] === true);
+    if (allAgreed) {
+      // reset to lobby for re-bidding
+      this.room.phase = 'LOBBY';
+      this.room.bids = {};
+      this.room.bidDeadline = null;
+      this.room.choiceDeadline = null;
+      this.room.winnerId = null;
+      this.room.loserId = null;
+      this.room.winningBidMs = null;
+      this.room.losingBidMs = null;
+      this.room.drawOddsSide = null;
+      this.room.colors = {};
+      this.room.clocks = null;
+      this.room.moves = [];
+      this.room.choiceAttempts = 0;
+      this.room.currentPicker = null;
+      this.room.rematchWindowEnds = null;
+      this.room.rematchVotes = null;
+      await this._save();
+      return this._response({ ok: true, rematchStarted: true, room: this.room });
+    }
+
+    return this._response({ ok: true, rematchStarted: false, votes: this.room.rematchVotes });
+  }
 }
 
 // Durable Object to track active rooms for matchmaking
@@ -546,6 +585,11 @@ export default {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
           return obj.fetch(new Request('https://do/makeMove', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'rematch' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/rematch', { method: 'POST', headers, body: bodyText }));
         }
       }
       return new Response(JSON.stringify({ error: 'route_not_found' }), { status: 404, headers: corsHeaders });
