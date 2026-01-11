@@ -5,6 +5,7 @@ export class GameRoom {
     this.state = state;
     this.env = env;
     this.room = null;
+    this._sockets = new Set();
   }
 
   _corsHeaders() {
@@ -119,6 +120,14 @@ export class GameRoom {
     server.accept();
     server.serializeAttachment({ playerId });  // Store playerId for identification on wake-up
 
+    // track this server socket for broadcasts while the DO instance is alive
+    try {
+      this._sockets.add(server);
+      server.addEventListener('close', () => {
+        try { this._sockets.delete(server); } catch (e) {}
+      });
+    } catch (e) {}
+
     // Send initial state immediately
     server.send(JSON.stringify({ type: 'init', room: this.room }));
 
@@ -127,17 +136,13 @@ export class GameRoom {
   }
 
   _broadcastUpdate() {
-    const websockets = this.state.getWebSockets();
-    if (websockets.length === 0) return;
-
     const msg = JSON.stringify({ type: 'update', room: this.room });
-
-    for (const ws of websockets) {
+    for (const ws of this._sockets) {
       try {
-        if (ws.readyState === 1) {  // OPEN
-          ws.send(msg);
-        }
-      } catch {}
+        if (ws && ws.readyState === 1) ws.send(msg);
+      } catch (e) {
+        // ignore
+      }
     }
   }
 
