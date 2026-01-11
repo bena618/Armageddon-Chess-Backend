@@ -4,12 +4,9 @@ compatibility_date = "2026-01-07"
 
 [durable_objects]
 bindings = [
-  { name = "GAME_ROOMS", class_name = "GameRoom" }
+  { name = "GAME_ROOMS", class_name = "GameRoom" },
+  { name = "ROOM_INDEX", class_name = "RoomIndex" }
 ]
-
-[[durable_objects.bindings]]
-name = "ROOM_INDEX"
-class_name = "RoomIndex"
 
 [sqlite]
 enabled = true
