@@ -56,10 +56,27 @@ export class GameRoom {
     };
   }
 
+  // Helper: notify RoomIndex about room metadata
+  async _indexUpdate() {
+    try {
+      if (!this.env || !this.env.ROOM_INDEX) return;
+      const indexId = this.env.ROOM_INDEX.idFromName('index');
+      const obj = this.env.ROOM_INDEX.get(indexId);
+      const meta = {
+        roomId: this.room.roomId,
+        phase: this.room.phase,
+        players: (this.room.players || []).length,
+        updatedAt: this.room.updatedAt || this._now()
+      };
+      await obj.fetch(new Request('https://do/update', { method: 'POST', body: JSON.stringify(meta), headers: { 'Content-Type': 'application/json' } }));
+    } catch (e) {}
+  }
+
   async _save() {
     this.room.updatedAt = Date.now();
     await this.state.storage.put('room', this.room);
     this._broadcastUpdate();
+    await this._indexUpdate();
   }
 
   _now() {
@@ -353,8 +370,11 @@ export class GameRoom {
     if (isCheckmate) {
       this.room.phase = 'FINISHED';
       this.room.winnerId = playerId;
+      // open rematch window (60s)
+      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchVotes = {};
       await this._save();
-      return this._response({ ok: true, result: 'checkmate', winnerId: playerId, clocks: this.room.clocks, moves: this.room.moves });
+      return this._response({ ok: true, result: 'checkmate', winnerId: playerId, clocks: this.room.clocks, moves: this.room.moves, rematchWindowEnds: this.room.rematchWindowEnds });
     }
 
     await this._save();
@@ -364,7 +384,63 @@ export class GameRoom {
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
+    // cleanup rematch window expiry and possibly mark room removable
+    if (this.room.phase === 'FINISHED' && this.room.rematchWindowEnds && this._now() > this.room.rematchWindowEnds) {
+      // if rematchVotes do not indicate unanimous agreement, remove index entry
+      const players = (this.room.players || []).map(p => p.id);
+      const votes = this.room.rematchVotes || {};
+      const bothAgreed = players.length > 0 && players.every(pid => votes[pid] === true);
+      if (!bothAgreed) {
+        try {
+          if (this.env && this.env.ROOM_INDEX) {
+            const indexId = this.env.ROOM_INDEX.idFromName('index');
+            const obj = this.env.ROOM_INDEX.get(indexId);
+            await obj.fetch(new Request('https://do/remove', { method: 'POST', body: JSON.stringify({ roomId: this.room.roomId }), headers: { 'Content-Type': 'application/json' } }));
+          }
+        } catch (e) {}
+      }
+    }
     return this._response({ ok: true, room: this.room });
+  }
+}
+
+// Durable Object to track active rooms for matchmaking
+export class RoomIndex {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async _getAll() {
+    const raw = await this.state.storage.get('rooms');
+    return raw || {};
+  }
+
+  async _saveAll(obj) {
+    await this.state.storage.put('rooms', obj);
+  }
+
+  async fetch(request) {
+    if (request.method === 'POST' && request.url.endsWith('/update')) {
+      const body = await request.json().catch(() => ({}));
+      const rooms = await this._getAll();
+      rooms[body.roomId] = { roomId: body.roomId, phase: body.phase, players: body.players || 0, updatedAt: body.updatedAt || Date.now() };
+      await this._saveAll(rooms);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (request.method === 'POST' && request.url.endsWith('/remove')) {
+      const body = await request.json().catch(() => ({}));
+      const rooms = await this._getAll();
+      delete rooms[body.roomId];
+      await this._saveAll(rooms);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (request.method === 'GET' && request.url.endsWith('/list')) {
+      const rooms = await this._getAll();
+      const list = Object.values(rooms).filter(r => r.phase !== 'FINISHED');
+      return new Response(JSON.stringify({ ok: true, rooms: list }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
@@ -399,6 +475,41 @@ export default {
         const res = await obj.fetch(initReq);
         const data = await res.json();
         return new Response(JSON.stringify({ ok: true, roomId, meta: data }), { headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) });
+      }
+
+      // Join-next: choose a random lobby room via RoomIndex
+      if (request.method === 'POST' && url.pathname === '/rooms/join-next') {
+        const body = await request.json().catch(() => ({}));
+        const playerId = body.playerId;
+        const name = body.name || null;
+        // query RoomIndex
+        if (!env.ROOM_INDEX) return new Response(JSON.stringify({ error: 'no_matchmaking' }), { status: 500, headers: corsHeaders });
+        const idxId = env.ROOM_INDEX.idFromName('index');
+        const idxObj = env.ROOM_INDEX.get(idxId);
+        const listRes = await idxObj.fetch(new Request('https://do/list'));
+        const listData = await listRes.json().catch(() => ({ rooms: [] }));
+        const rooms = listData.rooms || [];
+        // filter lobby rooms with space
+        const candidates = [];
+        for (const r of rooms) {
+          // fetch room state
+          const id = env.GAME_ROOMS.idFromName(r.roomId);
+          const obj = env.GAME_ROOMS.get(id);
+          const stateRes = await obj.fetch(new Request('https://do/getState'));
+          const data = await stateRes.json().catch(() => ({}));
+          const room = data.room || data;
+          if (room && room.phase === 'LOBBY' && (room.players || []).length < (room.maxPlayers || 2)) candidates.push(room);
+        }
+        if (candidates.length === 0) return new Response(JSON.stringify({ error: 'no_lobby_rooms' }), { status: 404, headers: corsHeaders });
+        const pick = candidates[Math.floor(Math.random() * candidates.length)];
+        // join that room via its DO
+        const roomId = pick.roomId;
+        const objId = env.GAME_ROOMS.idFromName(roomId);
+        const obj = env.GAME_ROOMS.get(objId);
+        const joinReq = new Request('https://do/joinRoom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId, name }) });
+        const joinRes = await obj.fetch(joinReq);
+        const joinData = await joinRes.json().catch(() => ({}));
+        return new Response(JSON.stringify({ ok: true, room: joinData.room || joinData }), { headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) });
       }
 
       if (segments[0] === 'rooms' && segments[1]) {
