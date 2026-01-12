@@ -431,13 +431,30 @@ export class GameRoom {
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
-    // expire pending start-bidding requests
+    // expire pending start-bidding requests: clear request and mark expired
     const now = this._now();
     if (this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
       this.room.startRequestedBy = null;
       this.room.startConfirmDeadline = null;
       this.room.phase = 'LOBBY';
       this.room.closed = true;
+      // record when the start request expired so we can remove room later if unused
+      if (!this.room.startExpiredAt) this.room.startExpiredAt = now;
+      await this._save();
+    }
+
+    // If startExpiredAt is older than 10 minutes, remove room from index so it's no longer considered in use
+    if (this.room.startExpiredAt && (now - this.room.startExpiredAt) > (10 * 60 * 1000)) {
+      try {
+        if (this.env && this.env.ROOM_INDEX) {
+          const indexId = this.env.ROOM_INDEX.idFromName('index');
+          const obj = this.env.ROOM_INDEX.get(indexId);
+          await obj.fetch(new Request('https://do/remove', { method: 'POST', body: JSON.stringify({ roomId: this.room.roomId }), headers: { 'Content-Type': 'application/json' } }));
+        }
+      } catch (e) {}
+      // mark removed to avoid repeated attempts
+      this.room.startExpiredAt = null;
+      this.room.removedAt = now;
       await this._save();
     }
     // cleanup rematch window expiry and possibly mark room removable
