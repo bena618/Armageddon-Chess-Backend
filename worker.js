@@ -414,6 +414,20 @@ export class GameRoom {
     return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
   }
 
+  async _handleTimeForfeit(request) {
+    const body = await request.json().catch(() => ({}));
+    const { timedOutPlayerId } = body;
+    if (this.room.phase !== 'PLAYING') return this._response({ error: 'invalid_phase' }, 400);
+    if (!timedOutPlayerId) return this._response({ error: 'timedOutPlayerId_required' }, 400);
+    const other = this.room.players.find(p => p.id !== timedOutPlayerId)?.id || null;
+    this.room.phase = 'FINISHED';
+    this.room.winnerId = other;
+    this.room.rematchWindowEnds = this._now() + 60 * 1000;
+    this.room.rematchVotes = {};
+    await this._save();
+    return this._response({ ok: true, winnerId: other, rematchWindowEnds: this.room.rematchWindowEnds });
+  }
+
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
@@ -626,6 +640,11 @@ export default {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
           return obj.fetch(new Request('https://do/makeMove', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'time-forfeit' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/timeForfeit', { method: 'POST', headers, body: bodyText }));
         }
         if (segments.length === 3 && segments[2] === 'rematch' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
