@@ -442,6 +442,7 @@ export class GameRoom {
       this.room.phase = 'LOBBY'; // Reset back to lobby so room can be reused
       startExpired = true; // Flag for frontend to redirect
       await this._save();
+      this._broadcastUpdate() //Makes it so both players sent back not just one who made request
     }
 
     // If startExpiredAt is older than 10 minutes, remove room from index so it's no longer considered in use
