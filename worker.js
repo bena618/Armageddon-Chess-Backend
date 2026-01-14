@@ -431,15 +431,16 @@ export class GameRoom {
   async _handleGetState() {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
-    // expire pending start-bidding requests: clear request and mark expired
+
     const now = this._now();
+
+    // Auto-expire unconfirmed start request
+    let startExpired = false;
     if (this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
       this.room.startRequestedBy = null;
       this.room.startConfirmDeadline = null;
-      this.room.phase = 'LOBBY';
-      this.room.closed = true;
-      // record when the start request expired so we can remove room later if unused
-      if (!this.room.startExpiredAt) this.room.startExpiredAt = now;
+      this.room.phase = 'LOBBY'; // Reset back to lobby so room can be reused
+      startExpired = true; // Flag for frontend to redirect
       await this._save();
     }
 
@@ -452,7 +453,6 @@ export class GameRoom {
           await obj.fetch(new Request('https://do/remove', { method: 'POST', body: JSON.stringify({ roomId: this.room.roomId }), headers: { 'Content-Type': 'application/json' } }));
         }
       } catch (e) {}
-      // mark removed to avoid repeated attempts
       this.room.startExpiredAt = null;
       this.room.removedAt = now;
       await this._save();
@@ -473,9 +473,14 @@ export class GameRoom {
         } catch (e) {}
       }
     }
-    return this._response({ ok: true, room: this.room });
-  }
 
+    // Return with the expired flag
+    return this._response({ 
+      ok: true, 
+      room: this.room,
+      startExpired: startExpired // Frontend can use this to redirect
+    });
+  }
   async _handleRematch(request) {
     const body = await request.json().catch(() => ({}));
     const { playerId, agree } = body;
