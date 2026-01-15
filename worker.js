@@ -427,27 +427,26 @@ async _handleMakeMove(request) {
   }
 
   async _handleGetState() {
+    const now = this._now();
+    let saveNeeded = false;
+
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
-
-    const now = this._now();
 
     // Close room if start request expired
     if (!this.room.closed && this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
       this.room.startRequestedBy = null;
       this.room.startConfirmDeadline = null;
-
       this.room.closed = true;
       this.room.closeReason = 'start_expired';
       this.room.closedAt = now;
-
-      await this._save();
+      saveNeeded = true;
     }
 
-    // Remove room from index if it has been closed >10 minutes
-    if (this.room.closed && this.room.closeReason === 'start_expired' && this.room.closedAt && (now - this.room.closedAt) > (10 * 60 * 1000)) {
+    // Remove room from index if closed >10 minutes
+    if (this.room.closed && this.room.closeReason === 'start_expired' && this.room.closedAt && (now - this.room.closedAt) > 10 * 60 * 1000) {
       try {
-        if (this.env && this.env.ROOM_INDEX) {
+        if (this.env?.ROOM_INDEX) {
           const indexId = this.env.ROOM_INDEX.idFromName('index');
           const obj = this.env.ROOM_INDEX.get(indexId);
           await obj.fetch(new Request('https://do/remove', {
@@ -458,7 +457,7 @@ async _handleMakeMove(request) {
         }
       } catch (e) {}
       this.room.removedAt = now;
-      await this._save();
+      saveNeeded = true;
     }
 
     // Cleanup rematch window expiry for finished games
@@ -468,7 +467,7 @@ async _handleMakeMove(request) {
       const bothAgreed = players.length > 0 && players.every(pid => votes[pid] === true);
       if (!bothAgreed) {
         try {
-          if (this.env && this.env.ROOM_INDEX) {
+          if (this.env?.ROOM_INDEX) {
             const indexId = this.env.ROOM_INDEX.idFromName('index');
             const obj = this.env.ROOM_INDEX.get(indexId);
             await obj.fetch(new Request('https://do/remove', {
@@ -481,11 +480,11 @@ async _handleMakeMove(request) {
       }
     }
 
-    return this._response({ 
-      ok: true, 
-      room: this.room,
-    });
+    if (saveNeeded) await this._save();
+
+    return this._response({ ok: true, room: this.room });
   }
+
   
   async _handleRematch(request) {
     const body = await request.json().catch(() => ({}));
