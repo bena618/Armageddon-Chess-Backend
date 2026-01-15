@@ -104,6 +104,7 @@ export class GameRoom {
       if (path === '/submitBid' && request.method === 'POST') return this._handleSubmitBid(request);
       if (path === '/chooseColor' && request.method === 'POST') return this._handleChooseColor(request);
       if (path === '/makeMove' && request.method === 'POST') return this._handleMakeMove(request);
+      if (path === '/leaveRoom' && request.method === 'POST') return this._handleLeave(request);
       if (path === '/rematch' && request.method === 'POST') return this._handleRematch(request);
       if (path === '/getState' && request.method === 'GET') return this._handleGetState();
       return this._response({ error: 'not_found' }, 404);
@@ -523,6 +524,25 @@ async _handleMakeMove(request) {
 
     return this._response({ ok: true, rematchStarted: false, votes: this.room.rematchVotes });
   }
+
+    async _handleLeave(request) {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      if (!playerId) return this._response({ error: 'playerId_required' }, 400);
+
+      const beforeCount = (this.room.players || []).length;
+      this.room.players = (this.room.players || []).filter(p => p.id !== playerId);
+
+      if (this.room.players.length === beforeCount) {
+        return this._response({ ok: true, room: this.room });
+      }
+
+      await this._save();
+      return this._response({ ok: true, room: this.room });
+    }
+
+
+
 }
 
 // Durable Object to track active rooms for matchmaking
@@ -610,16 +630,22 @@ export default {
         const listRes = await idxObj.fetch(new Request('https://do/list'));
         const listData = await listRes.json().catch(() => ({ rooms: [] }));
         const rooms = listData.rooms || [];
-        // filter lobby rooms with space
+
         const candidates = [];
         for (const r of rooms) {
-          // fetch room state
           const id = env.GAME_ROOMS.idFromName(r.roomId);
           const obj = env.GAME_ROOMS.get(id);
           const stateRes = await obj.fetch(new Request('https://do/getState'));
           const data = await stateRes.json().catch(() => ({}));
           const room = data.room || data;
-          if (room && room.phase === 'LOBBY' && (room.players || []).length < (room.maxPlayers || 2)) candidates.push(room);
+          if (!room) continue;
+
+          const alreadyInRoom = (room.players || []).some(p => p.id === playerId);
+          if (alreadyInRoom) continue;
+
+          if (room.phase === 'LOBBY' && (room.players || []).length < (room.maxPlayers || 2)) {
+            candidates.push(room);
+          }
         }
         if (candidates.length === 0) return new Response(JSON.stringify({ error: 'no_lobby_rooms' }), { status: 404, headers: corsHeaders });
         const pick = candidates[Math.floor(Math.random() * candidates.length)];
@@ -678,6 +704,12 @@ export default {
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
           return obj.fetch(new Request('https://do/rematch', { method: 'POST', headers, body: bodyText }));
         }
+        if (segments.length === 3 && segments[2] === 'leave' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/leaveRoom', { method: 'POST', headers, body: bodyText }));
+        }
+
       }
       return new Response(JSON.stringify({ error: 'route_not_found' }), { status: 404, headers: corsHeaders });
     } catch (err) {
