@@ -54,10 +54,14 @@ export class GameRoom {
       bidDurationMs: 10000,
       choiceDurationMs: 10000,
       mainTimeMs: 300000,
-
+      
       closed: false,
       closeReason: null,
-      closedAt: null
+      closedAt: null,
+
+      disconnectedPlayerId: null,
+      disconnectStart: null,
+      disconnectTimeoutMs: 45000, // 45 seconds
     };
   }
 
@@ -107,6 +111,8 @@ export class GameRoom {
       if (path === '/leaveRoom' && request.method === 'POST') return this._handleLeave(request);
       if (path === '/rematch' && request.method === 'POST') return this._handleRematch(request);
       if (path === '/getState' && request.method === 'GET') return this._handleGetState();
+      if (path === '/heartbeat' && request.method === 'POST') return this._handleHeartbeat(request);
+
       return this._response({ error: 'not_found' }, 404);
     } catch (err) {
       return this._response({ error: err?.message || String(err) }, 400);
@@ -354,64 +360,76 @@ export class GameRoom {
     await this._save();
   }
 
-async _handleMakeMove(request) {
-  const body = await request.json();
-  const { playerId, move } = body;
+  async _handleMakeMove(request) {
+    const body = await request.json();
+    const { playerId, move } = body;
 
-  if (this.room.phase !== 'PLAYING') return this._response({ error: 'not_playing' }, 400);
+    if (this.room.phase !== 'PLAYING') return this._response({ error: 'not_playing' }, 400);
 
-  const playerColor = this.room.colors[playerId];
-  if (!playerColor) return this._response({ error: 'unknown_player_color' }, 400);
-  if (playerColor !== this.room.clocks.turn) return this._response({ error: 'not_your_turn' }, 400);
+    const playerColor = this.room.colors[playerId];
+    if (!playerColor) return this._response({ error: 'unknown_player_color' }, 400);
+    if (playerColor !== this.room.clocks.turn) return this._response({ error: 'not_your_turn' }, 400);
 
-  const now = this._now();
-  const elapsed = now - (this.room.clocks.lastTickAt || now);
-  if (playerColor === 'white') this.room.clocks.whiteRemainingMs -= elapsed;
-  else this.room.clocks.blackRemainingMs -= elapsed;
+    const now = this._now();
 
-  if ((playerColor === 'white' && this.room.clocks.whiteRemainingMs <= 0) ||
-      (playerColor === 'black' && this.room.clocks.blackRemainingMs <= 0)) {
-    const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
-    this.room.phase = 'FINISHED';
-    this.room.winnerId = winnerId;
+    // If this player was previously disconnected, clear disconnect state
+    if (this.room.disconnectedPlayerId === playerId) {
+      this.room.disconnectedPlayerId = null;
+      this.room.disconnectStart = null;
+    }
+    // Mark this player as active (heartbeat)
+    this.room.updatedAt = now;
+
+    const elapsed = now - (this.room.clocks.lastTickAt || now);
+    if (playerColor === 'white') this.room.clocks.whiteRemainingMs -= elapsed;
+    else this.room.clocks.blackRemainingMs -= elapsed;
+
+    if ((playerColor === 'white' && this.room.clocks.whiteRemainingMs <= 0) ||
+        (playerColor === 'black' && this.room.clocks.blackRemainingMs <= 0)) {
+      const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
+      this.room.phase = 'FINISHED';
+      this.room.winnerId = winnerId;
+      await this._save();
+      return this._response({ ok: true, result: 'time_forfeit', winnerId });
+    }
+
+    // Initialize or restore chess game from FEN
+    const game = new Chess(this.room.gameFen || undefined);
+
+    if (typeof move !== 'string' || move.length < 4) return this._response({ error: 'invalid_move_format' }, 400);
+    const from = move.slice(0, 2);
+    const to = move.slice(2, 4);
+    const promotion = move.length >= 5 ? move[4] : undefined;
+
+    const moved = game.move({ from, to, promotion: promotion || 'q' });
+    if (!moved) return this._response({ error: 'illegal_move' }, 400);
+
+    // Save updated game state
+    this.room.gameFen = game.fen();
+    this.room.moves.push({ by: playerId, move, at: now });
+    this.room.clocks.lastTickAt = now;
+    this.room.clocks.turn = this.room.clocks.turn === 'white' ? 'black' : 'white';
+
+    if (game.isCheckmate()) {
+      this.room.phase = 'FINISHED';
+      this.room.winnerId = playerId;
+      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchVotes = {};
+      await this._save();
+      return this._response({
+        ok: true,
+        result: 'checkmate',
+        winnerId: playerId,
+        clocks: this.room.clocks,
+        moves: this.room.moves,
+        rematchWindowEnds: this.room.rematchWindowEnds
+      });
+    }
+
     await this._save();
-    return this._response({ ok: true, result: 'time_forfeit', winnerId });
+    return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
   }
 
-  const game = new Chess(this.room.gameFen || undefined);
-
-  if (typeof move !== 'string' || move.length < 4) return this._response({ error: 'invalid_move_format' }, 400);
-  const from = move.slice(0, 2);
-  const to = move.slice(2, 4);
-  const promotion = move.length >= 5 ? move[4] : undefined;
-
-  const moved = game.move({ from, to, promotion: promotion || 'q' });
-  if (!moved) return this._response({ error: 'illegal_move' }, 400);
-
-  this.room.gameFen = game.fen();
-  this.room.moves.push({ by: playerId, move, at: now });
-  this.room.clocks.lastTickAt = now;
-  this.room.clocks.turn = this.room.clocks.turn === 'white' ? 'black' : 'white';
-
-  if (game.isCheckmate()) {
-    this.room.phase = 'FINISHED';
-    this.room.winnerId = playerId;
-    this.room.rematchWindowEnds = this._now() + 60 * 1000;
-    this.room.rematchVotes = {};
-    await this._save();
-    return this._response({
-      ok: true,
-      result: 'checkmate',
-      winnerId: playerId,
-      clocks: this.room.clocks,
-      moves: this.room.moves,
-      rematchWindowEnds: this.room.rematchWindowEnds
-    });
-  }
-
-  await this._save();
-  return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
-}
 
   async _handleTimeForfeit(request) {
     const body = await request.json().catch(() => ({}));
@@ -433,6 +451,33 @@ async _handleMakeMove(request) {
 
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
+
+    if (this.room.phase === 'PLAYING') {
+      // Detect new disconnect (no activity in 10s)
+      if (!this.room.disconnectedPlayerId && (now - (this.room.updatedAt || 0)) > 10000) {
+        // Find the inactive player (opposite of current turn)
+        const activePlayerId = Object.keys(this.room.colors || {}).find(id => 
+          this.room.colors[id] === this.room.clocks.turn
+        );
+        this.room.disconnectedPlayerId = activePlayerId ? 
+          Object.keys(this.room.colors || {}).find(id => id !== activePlayerId) : null;
+        if (this.room.disconnectedPlayerId) {
+          this.room.disconnectStart = now;
+          saveNeeded = true;
+        }
+      }
+
+      // Auto-forfeit after 45s disconnect
+      if (this.room.disconnectedPlayerId && this.room.disconnectStart && 
+          (now - this.room.disconnectStart) > this.room.disconnectTimeoutMs) {
+        const winnerId = this.room.disconnectedPlayerId === Object.keys(this.room.colors || {})[0] ? 
+          Object.keys(this.room.colors || {})[1] : Object.keys(this.room.colors || {})[0];
+        this.room.phase = 'FINISHED';
+        this.room.winnerId = winnerId;
+        this.room.closeReason = 'disconnect_forfeit';
+        saveNeeded = true;
+      }
+    }
 
     // Close room if start request expired
     if (!this.room.closed && this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
@@ -540,6 +585,15 @@ async _handleMakeMove(request) {
       await this._save();
       return this._response({ ok: true, room: this.room });
     }
+
+    async _handleHeartbeat(request) {
+      const { playerId } = await request.json().catch(() => ({}));
+      if (playerId) {
+        this.room.updatedAt = this._now();
+      }
+      return this._response({ ok: true });
+    }
+
 
 
 
@@ -708,6 +762,11 @@ export default {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
           return obj.fetch(new Request('https://do/leaveRoom', { method: 'POST', headers, body: bodyText }));
+        }
+        if (segments.length === 3 && segments[2] === 'heartbeat' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          return obj.fetch(new Request('https://do/heartbeat', { method: 'POST', headers, body: bodyText }));
         }
 
       }
