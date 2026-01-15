@@ -353,76 +353,64 @@ export class GameRoom {
     await this._save();
   }
 
-  async _handleMakeMove(request) {
-    const body = await request.json();
-    const { playerId, move } = body;
-    if (this.room.phase !== 'PLAYING') return this._response({ error: 'not_playing' }, 400);
+async _handleMakeMove(request) {
+  const body = await request.json();
+  const { playerId, move } = body;
 
-    const playerColor = this.room.colors[playerId];
-    if (!playerColor) return this._response({ error: 'unknown_player_color' }, 400);
-    if (playerColor !== this.room.clocks.turn) return this._response({ error: 'not_your_turn' }, 400);
+  if (this.room.phase !== 'PLAYING') return this._response({ error: 'not_playing' }, 400);
 
-    const now = this._now();
-    const elapsed = now - (this.room.clocks.lastTickAt || now);
-    if (playerColor === 'white') this.room.clocks.whiteRemainingMs -= elapsed;
-    else this.room.clocks.blackRemainingMs -= elapsed;
+  const playerColor = this.room.colors[playerId];
+  if (!playerColor) return this._response({ error: 'unknown_player_color' }, 400);
+  if (playerColor !== this.room.clocks.turn) return this._response({ error: 'not_your_turn' }, 400);
 
-    if ((playerColor === 'white' && this.room.clocks.whiteRemainingMs <= 0) ||
-        (playerColor === 'black' && this.room.clocks.blackRemainingMs <= 0)) {
-      const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
-      this.room.phase = 'FINISHED';
-      this.room.winnerId = winnerId;
-      await this._save();
-      return this._response({ ok: true, result: 'time_forfeit', winnerId });
-    }
+  const now = this._now();
+  const elapsed = now - (this.room.clocks.lastTickAt || now);
+  if (playerColor === 'white') this.room.clocks.whiteRemainingMs -= elapsed;
+  else this.room.clocks.blackRemainingMs -= elapsed;
 
-    const game = new Chess();
-    if (this.room.moves && this.room.moves.length > 0) {
-      for (const m of this.room.moves) {
-        try {
-          if (typeof m.move === 'string' && m.move.length >= 4) {
-            const from = m.move.slice(0,2);
-            const to = m.move.slice(2,4);
-            const promotion = m.move.length >= 5 ? m.move[4] : undefined;
-            if (promotion) game.move({ from, to, promotion });
-            else game.move({ from, to });
-          } else {
-            game.move(m.move);
-          }
-        } catch (e) {}
-      }
-    }
-
-    if (typeof move !== 'string' || move.length < 4) return this._response({ error: 'invalid_move_format' }, 400);
-    const from = move.slice(0,2);
-    const to = move.slice(2,4);
-    const promotion = move.length >= 5 ? move[4] : undefined;
-
-    const test = new Chess(game.fen());
-    const moved = test.move({ from, to, promotion: promotion || 'q' });
-    if (!moved) return this._response({ error: 'illegal_move' }, 400);
-
-    this.room.moves.push({ by: playerId, move, at: now });
-    this.room.clocks.lastTickAt = now;
-    this.room.clocks.turn = this.room.clocks.turn === 'white' ? 'black' : 'white';
-
-    const after = new Chess(game.fen());
-    after.move({ from, to, promotion: promotion || 'q' });
-    const isCheckmate = (after.isCheckmate && typeof after.isCheckmate === 'function' && after.isCheckmate()) ||
-                        (after.in_checkmate && typeof after.in_checkmate === 'function' && after.in_checkmate());
-    if (isCheckmate) {
-      this.room.phase = 'FINISHED';
-      this.room.winnerId = playerId;
-      // open rematch window (60s)
-      this.room.rematchWindowEnds = this._now() + 60 * 1000;
-      this.room.rematchVotes = {};
-      await this._save();
-      return this._response({ ok: true, result: 'checkmate', winnerId: playerId, clocks: this.room.clocks, moves: this.room.moves, rematchWindowEnds: this.room.rematchWindowEnds });
-    }
-
+  if ((playerColor === 'white' && this.room.clocks.whiteRemainingMs <= 0) ||
+      (playerColor === 'black' && this.room.clocks.blackRemainingMs <= 0)) {
+    const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
+    this.room.phase = 'FINISHED';
+    this.room.winnerId = winnerId;
     await this._save();
-    return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
+    return this._response({ ok: true, result: 'time_forfeit', winnerId });
   }
+
+  const game = new Chess(this.room.gameFen || undefined);
+
+  if (typeof move !== 'string' || move.length < 4) return this._response({ error: 'invalid_move_format' }, 400);
+  const from = move.slice(0, 2);
+  const to = move.slice(2, 4);
+  const promotion = move.length >= 5 ? move[4] : undefined;
+
+  const moved = game.move({ from, to, promotion: promotion || 'q' });
+  if (!moved) return this._response({ error: 'illegal_move' }, 400);
+
+  this.room.gameFen = game.fen();
+  this.room.moves.push({ by: playerId, move, at: now });
+  this.room.clocks.lastTickAt = now;
+  this.room.clocks.turn = this.room.clocks.turn === 'white' ? 'black' : 'white';
+
+  if (game.isCheckmate()) {
+    this.room.phase = 'FINISHED';
+    this.room.winnerId = playerId;
+    this.room.rematchWindowEnds = this._now() + 60 * 1000;
+    this.room.rematchVotes = {};
+    await this._save();
+    return this._response({
+      ok: true,
+      result: 'checkmate',
+      winnerId: playerId,
+      clocks: this.room.clocks,
+      moves: this.room.moves,
+      rematchWindowEnds: this.room.rematchWindowEnds
+    });
+  }
+
+  await this._save();
+  return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
+}
 
   async _handleTimeForfeit(request) {
     const body = await request.json().catch(() => ({}));
