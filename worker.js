@@ -412,6 +412,7 @@ export class GameRoom {
         // Flag fell but opponent cannot possibly checkmate: draw
         this.room.phase = 'FINISHED';
         this.room.winnerId = null;
+        this.room.clocks.frozenAt = now;
         this.room.rematchWindowEnds = this._now() + 60 * 1000;
         this.room.rematchVotes = {};
         await this._save();
@@ -429,6 +430,7 @@ export class GameRoom {
       const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
       this.room.phase = 'FINISHED';
       this.room.winnerId = winnerId;
+      this.room.clocks.frozenAt = now; 
       this.room.rematchWindowEnds = this._now() + 60 * 1000;
       this.room.rematchVotes = {};
       await this._save();
@@ -458,6 +460,7 @@ export class GameRoom {
     if (game.isCheckmate()) {
       this.room.phase = 'FINISHED';
       this.room.winnerId = playerId;
+      this.room.clocks.frozenAt = now;  
       this.room.rematchWindowEnds = this._now() + 60 * 1000;
       this.room.rematchVotes = {};
       await this._save();
@@ -481,6 +484,7 @@ export class GameRoom {
     if (drawReason) {
       this.room.phase = 'FINISHED';
       this.room.winnerId = null;
+      this.room.clocks.frozenAt = now;
       this.room.rematchWindowEnds = this._now() + 60 * 1000;
       this.room.rematchVotes = {};
       await this._save();
