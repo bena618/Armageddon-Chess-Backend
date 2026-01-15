@@ -175,6 +175,9 @@ export class GameRoom {
 
   async _handleJoin(request) {
 
+    if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 1 * 60 * 60 * 1000) {
+      return this._response({ error: 'room_too_old' }, 410);
+    }
     if (this.room.closed) {
         return this._response({ error: 'room_closed' }, 410);
     }
@@ -452,6 +455,11 @@ export class GameRoom {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
 
+    if (this.room.updatedAt && (now - this.room.updatedAt) > 12 * 60 * 60 * 1000) {
+      await this.state.storage.delete('room');
+      return this._response({ error: 'room_expired' }, 410);
+    }
+
     if (this.room.phase === 'PLAYING') {
       // Detect new disconnect (no activity in 10s)
       if (!this.room.disconnectedPlayerId && (now - (this.room.updatedAt || 0)) > 10000) {
@@ -530,7 +538,6 @@ export class GameRoom {
 
     return this._response({ ok: true, room: this.room });
   }
-
   
   async _handleRematch(request) {
     const body = await request.json().catch(() => ({}));
