@@ -254,44 +254,43 @@ export class GameRoom {
 
   async _resolveBidsIfNeeded() {
     if (this.room.phase !== 'BIDDING') return;
-    const now = this._now();
-    const players = this.room.players.map(p => p.id);
-    const bothBid = players.every(id => !!this.room.bids[id]);
-    const deadlinePassed = this.room.bidDeadline && now > this.room.bidDeadline;
-    if (!bothBid && !deadlinePassed) return;
 
-    if (deadlinePassed) {
-      for (const pid of players) {
-        if (!this.room.bids[pid]) {
-          this.room.bids[pid] = { amount: this.room.mainTimeMs, submittedAt: now };
-        }
-      }
+    const now = this._now();
+    const [p1, p2] = this.room.players.map(p => p.id);
+    const bids = this.room.bids || {};
+
+    const b1 = bids[p1];
+    const b2 = bids[p2];
+    const deadlinePassed = this.room.bidDeadline && now > this.room.bidDeadline;
+
+    // Wait until both players have bid or deadline passed
+    if (!b1 || !b2) {
+      if (!deadlinePassed) return;
+      // Fill missing bids with max time
+      if (!b1) bids[p1] = { amount: this.room.mainTimeMs, submittedAt: now };
+      if (!b2) bids[p2] = { amount: this.room.mainTimeMs, submittedAt: now };
     }
 
-    const entries = Object.entries(this.room.bids || {});
-    if (entries.length === 0) {
-      this.room.winnerId = players[0] || null;
-      this.room.loserId = players.find(p => p !== this.room.winnerId) || null;
-      this.room.winningBidMs = null;
-      this.room.losingBidMs = null;
+    const updatedB1 = bids[p1];
+    const updatedB2 = bids[p2];
+
+    if (updatedB1.amount === updatedB2.amount) {
+      this.room.bids = {};
+      this.room.bidDeadline = now + this.room.bidDurationMs;
+      await this._save();
+      return;
+    }
+
+    if (updatedB1.amount < updatedB2.amount) {
+      this.room.winnerId = p1;
+      this.room.loserId = p2;
+      this.room.winningBidMs = updatedB1.amount;
+      this.room.losingBidMs = updatedB2.amount;
     } else {
-      entries.sort(([aid, aobj], [bid, bobj]) => {
-        if (aobj.amount !== bobj.amount) return aobj.amount - bobj.amount;
-        if (aobj.submittedAt !== bobj.submittedAt) return aobj.submittedAt - bobj.submittedAt;
-        return aid.localeCompare(bid);
-      });
-
-      if (entries.length > 1 && entries[0][1].amount === entries[1][1].amount) {
-        this.room.bids = {};
-        this.room.bidDeadline = now + this.room.bidDurationMs;
-        await this._save();
-        return;
-      }
-
-      this.room.winnerId = entries[0][0];
-      this.room.loserId = entries.length > 1 ? entries[1][0] : players.find(p => p !== this.room.winnerId) || null;
-      this.room.winningBidMs = entries[0][1].amount;
-      this.room.losingBidMs = entries.length > 1 ? entries[1][1].amount : null;
+      this.room.winnerId = p2;
+      this.room.loserId = p1;
+      this.room.winningBidMs = updatedB2.amount;
+      this.room.losingBidMs = updatedB1.amount;
     }
 
     this.room.drawOddsSide = null;
@@ -299,6 +298,7 @@ export class GameRoom {
     this.room.choiceAttempts = 0;
     this.room.currentPicker = 'winner';
     this.room.choiceDeadline = now + this.room.choiceDurationMs;
+
     await this._save();
   }
 
