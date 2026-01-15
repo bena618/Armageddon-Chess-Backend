@@ -383,21 +383,64 @@ export class GameRoom {
     // Mark this player as active (heartbeat)
     this.room.updatedAt = now;
 
+    // Initialize or restore chess game from FEN *before* clock timeout logic
+    const game = new Chess(this.room.gameFen || undefined);
+
     const elapsed = now - (this.room.clocks.lastTickAt || now);
     if (playerColor === 'white') this.room.clocks.whiteRemainingMs -= elapsed;
     else this.room.clocks.blackRemainingMs -= elapsed;
 
-    if ((playerColor === 'white' && this.room.clocks.whiteRemainingMs <= 0) ||
-        (playerColor === 'black' && this.room.clocks.blackRemainingMs <= 0)) {
+    const whiteFlagged = this.room.clocks.whiteRemainingMs <= 0;
+    const blackFlagged = this.room.clocks.blackRemainingMs <= 0;
+
+    if ((playerColor === 'white' && whiteFlagged) || (playerColor === 'black' && blackFlagged)) {
+      // Time expired for the moving side: check if opponent has mating material
+      const opponentColorLetter = playerColor === 'white' ? 'b' : 'w';
+
+      const pieces = game.board().flat().filter(Boolean);
+      const opponentPieces = pieces.filter(p => p.color === opponentColorLetter);
+      const opponentNonKing = opponentPieces.filter(p => p.type !== 'k');
+
+      const hasMajorOrPawn = opponentNonKing.some(p =>
+        p.type === 'q' || p.type === 'r' || p.type === 'p'
+      );
+      const hasMultipleMinors = opponentNonKing.length > 1;
+
+      const canEverMate = hasMajorOrPawn || hasMultipleMinors;
+
+      if (!canEverMate) {
+        // Flag fell but opponent cannot possibly checkmate: draw
+        this.room.phase = 'FINISHED';
+        this.room.winnerId = null;
+        this.room.rematchWindowEnds = this._now() + 60 * 1000;
+        this.room.rematchVotes = {};
+        await this._save();
+        return this._response({
+          ok: true,
+          result: 'draw',
+          reason: 'timeout_but_opponent_cannot_mate',
+          clocks: this.room.clocks,
+          moves: this.room.moves,
+          rematchWindowEnds: this.room.rematchWindowEnds
+        });
+      }
+
+      // Normal time-forfeit win
       const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
       this.room.phase = 'FINISHED';
       this.room.winnerId = winnerId;
+      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchVotes = {};
       await this._save();
-      return this._response({ ok: true, result: 'time_forfeit', winnerId });
+      return this._response({
+        ok: true,
+        result: 'time_forfeit',
+        winnerId,
+        clocks: this.room.clocks,
+        moves: this.room.moves,
+        rematchWindowEnds: this.room.rematchWindowEnds
+      });
     }
-
-    // Initialize or restore chess game from FEN
-    const game = new Chess(this.room.gameFen || undefined);
 
     if (typeof move !== 'string' || move.length < 4) return this._response({ error: 'invalid_move_format' }, 400);
     const from = move.slice(0, 2);
@@ -407,7 +450,6 @@ export class GameRoom {
     const moved = game.move({ from, to, promotion: promotion || 'q' });
     if (!moved) return this._response({ error: 'illegal_move' }, 400);
 
-    // Save updated game state
     this.room.gameFen = game.fen();
     this.room.moves.push({ by: playerId, move, at: now });
     this.room.clocks.lastTickAt = now;
@@ -429,23 +471,87 @@ export class GameRoom {
       });
     }
 
+    // Draw conditions (stalemate, insufficient material, threefold, 50-move)
+    let drawReason = null;
+    if (game.isStalemate()) drawReason = 'stalemate';
+    else if (game.isInsufficientMaterial()) drawReason = 'insufficient_material';
+    else if (game.isThreefoldRepetition()) drawReason = 'threefold_repetition';
+    else if (game.isFiftyMoves()) drawReason = 'fifty_move_rule';
+
+    if (drawReason) {
+      this.room.phase = 'FINISHED';
+      this.room.winnerId = null;
+      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchVotes = {};
+      await this._save();
+      return this._response({
+        ok: true,
+        result: 'draw',
+        reason: drawReason,
+        clocks: this.room.clocks,
+        moves: this.room.moves,
+        rematchWindowEnds: this.room.rematchWindowEnds
+      });
+    }
+
     await this._save();
     return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
   }
 
-
   async _handleTimeForfeit(request) {
     const body = await request.json().catch(() => ({}));
     const { timedOutPlayerId } = body;
+
     if (this.room.phase !== 'PLAYING') return this._response({ error: 'invalid_phase' }, 400);
     if (!timedOutPlayerId) return this._response({ error: 'timedOutPlayerId_required' }, 400);
-    const other = this.room.players.find(p => p.id !== timedOutPlayerId)?.id || null;
+
+    // Reconstruct game to inspect material
+    const game = new Chess(this.room.gameFen || undefined);
+
+    // Identify opponent
+    const opponent = this.room.players.find(p => p.id !== timedOutPlayerId) || null;
+    const opponentId = opponent ? opponent.id : null;
+    const opponentColor = opponentId && this.room.colors ? this.room.colors[opponentId] : null;
+    const opponentColorLetter = opponentColor === 'white' ? 'w' : (opponentColor === 'black' ? 'b' : null);
+
+    let result = 'time_forfeit';
+    let reason = null;
+    let winnerId = opponentId;
+
+    if (opponentColorLetter) {
+      const pieces = game.board().flat().filter(Boolean);
+      const opponentPieces = pieces.filter(p => p.color === opponentColorLetter);
+      const opponentNonKing = opponentPieces.filter(p => p.type !== 'k');
+
+      const hasMajorOrPawn = opponentNonKing.some(p =>
+        p.type === 'q' || p.type === 'r' || p.type === 'p'
+      );
+      const hasMultipleMinors = opponentNonKing.length > 1;
+
+      const canEverMate = hasMajorOrPawn || hasMultipleMinors;
+
+      if (!canEverMate) {
+        result = 'draw';
+        reason = 'timeout_but_opponent_cannot_mate';
+        winnerId = null;
+      }
+    }
+
     this.room.phase = 'FINISHED';
-    this.room.winnerId = other;
+    this.room.winnerId = winnerId;
     this.room.rematchWindowEnds = this._now() + 60 * 1000;
     this.room.rematchVotes = {};
     await this._save();
-    return this._response({ ok: true, winnerId: other, rematchWindowEnds: this.room.rematchWindowEnds });
+
+    const responseBody = {
+      ok: true,
+      result,
+      winnerId,
+      rematchWindowEnds: this.room.rematchWindowEnds
+    };
+    if (reason) responseBody.reason = reason;
+
+    return this._response(responseBody);
   }
 
   async _handleGetState() {
