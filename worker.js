@@ -53,12 +53,17 @@ export class GameRoom {
       updatedAt: now,
       bidDurationMs: 10000,
       choiceDurationMs: 10000,
-      mainTimeMs: 300000
+      mainTimeMs: 300000,
+
+      closed: false,
+      closeReason: null,
+      closedAt: null
     };
   }
 
-  // Helper: notify RoomIndex about room metadata
   async _indexUpdate() {
+    if (this.room.closed) return;
+
     try {
       if (!this.env || !this.env.ROOM_INDEX) return;
       const indexId = this.env.ROOM_INDEX.idFromName('index');
@@ -162,6 +167,11 @@ export class GameRoom {
   }
 
   async _handleJoin(request) {
+
+    if (this.room.closed) {
+        return this._response({ error: 'room_closed' }, 410);
+    }
+
     const body = await request.json();
     const { playerId, name } = body;
     if (!playerId) return this._response({ error: 'playerId_required' }, 400);
@@ -434,33 +444,37 @@ export class GameRoom {
 
     const now = this._now();
 
-    // Auto-expire unconfirmed start request
-    let startExpired = false;
-    if (this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
+    // Close room if start request expired
+    if (!this.room.closed && this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
       this.room.startRequestedBy = null;
       this.room.startConfirmDeadline = null;
-      this.room.phase = 'LOBBY'; // Reset back to lobby so room can be reused
-      startExpired = true; // Flag for frontend to redirect
+
+      this.room.closed = true;
+      this.room.closeReason = 'start_expired';
+      this.room.closedAt = now;
+
       await this._save();
-      this._broadcastUpdate() //Makes it so both players sent back not just one who made request
     }
 
-    // If startExpiredAt is older than 10 minutes, remove room from index so it's no longer considered in use
-    if (this.room.startExpiredAt && (now - this.room.startExpiredAt) > (10 * 60 * 1000)) {
+    // Remove room from index if it has been closed >10 minutes
+    if (this.room.closed && this.room.closeReason === 'start_expired' && this.room.closedAt && (now - this.room.closedAt) > (10 * 60 * 1000)) {
       try {
         if (this.env && this.env.ROOM_INDEX) {
           const indexId = this.env.ROOM_INDEX.idFromName('index');
           const obj = this.env.ROOM_INDEX.get(indexId);
-          await obj.fetch(new Request('https://do/remove', { method: 'POST', body: JSON.stringify({ roomId: this.room.roomId }), headers: { 'Content-Type': 'application/json' } }));
+          await obj.fetch(new Request('https://do/remove', {
+            method: 'POST',
+            body: JSON.stringify({ roomId: this.room.roomId }),
+            headers: { 'Content-Type': 'application/json' }
+          }));
         }
       } catch (e) {}
-      this.room.startExpiredAt = null;
       this.room.removedAt = now;
       await this._save();
     }
-    // cleanup rematch window expiry and possibly mark room removable
-    if (this.room.phase === 'FINISHED' && this.room.rematchWindowEnds && this._now() > this.room.rematchWindowEnds) {
-      // if rematchVotes do not indicate unanimous agreement, remove index entry
+
+    // Cleanup rematch window expiry for finished games
+    if (this.room.phase === 'FINISHED' && this.room.rematchWindowEnds && now > this.room.rematchWindowEnds) {
       const players = (this.room.players || []).map(p => p.id);
       const votes = this.room.rematchVotes || {};
       const bothAgreed = players.length > 0 && players.every(pid => votes[pid] === true);
@@ -469,19 +483,22 @@ export class GameRoom {
           if (this.env && this.env.ROOM_INDEX) {
             const indexId = this.env.ROOM_INDEX.idFromName('index');
             const obj = this.env.ROOM_INDEX.get(indexId);
-            await obj.fetch(new Request('https://do/remove', { method: 'POST', body: JSON.stringify({ roomId: this.room.roomId }), headers: { 'Content-Type': 'application/json' } }));
+            await obj.fetch(new Request('https://do/remove', {
+              method: 'POST',
+              body: JSON.stringify({ roomId: this.room.roomId }),
+              headers: { 'Content-Type': 'application/json' }
+            }));
           }
         } catch (e) {}
       }
     }
 
-    // Return with the expired flag
     return this._response({ 
       ok: true, 
       room: this.room,
-      startExpired: startExpired // Frontend can use this to redirect
     });
   }
+  
   async _handleRematch(request) {
     const body = await request.json().catch(() => ({}));
     const { playerId, agree } = body;
