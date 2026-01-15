@@ -672,45 +672,49 @@ export default {
         return new Response(JSON.stringify({ ok: true, roomId, meta: data }), { headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) });
       }
 
-      // Join-next: choose a random lobby room via RoomIndex
-      if (request.method === 'POST' && url.pathname === '/rooms/join-next') {
-        const body = await request.json().catch(() => ({}));
-        const playerId = body.playerId;
-        const name = body.name || null;
-        // query RoomIndex
-        if (!env.ROOM_INDEX) return new Response(JSON.stringify({ error: 'no_matchmaking' }), { status: 500, headers: corsHeaders });
-        const idxId = env.ROOM_INDEX.idFromName('index');
-        const idxObj = env.ROOM_INDEX.get(idxId);
-        const listRes = await idxObj.fetch(new Request('https://do/list'));
-        const listData = await listRes.json().catch(() => ({ rooms: [] }));
-        const rooms = listData.rooms || [];
+    if (request.method === 'POST' && url.pathname === '/rooms/join-next') {
+      const body = await request.json().catch(() => ({}));
+      const playerId = body.playerId;
+      const name = body.name || null;
+      
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_matchmaking' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      const listRes = await idxObj.fetch(new Request('https://do/list'));
+      const listData = await listRes.json().catch(() => ({ rooms: [] }));
+      const rooms = listData.rooms || [];
 
-        const candidates = [];
-        for (const r of rooms) {
-          const id = env.GAME_ROOMS.idFromName(r.roomId);
-          const obj = env.GAME_ROOMS.get(id);
-          const stateRes = await obj.fetch(new Request('https://do/getState'));
-          const data = await stateRes.json().catch(() => ({}));
-          const room = data.room || data;
-          if (!room) continue;
+      const candidates = rooms.filter(r => 
+        r.phase === 'LOBBY' && 
+        r.players < 2
+      );
+      if (candidates.length === 0) {
+        return new Response(JSON.stringify({ error: 'no_lobby_rooms' }), { 
+          status: 404, 
+          headers: corsHeaders 
+        });
+      }
 
-          const alreadyInRoom = (room.players || []).some(p => p.id === playerId);
-          if (alreadyInRoom) continue;
-
-          if (room.phase === 'LOBBY' && (room.players || []).length < (room.maxPlayers || 2)) {
-            candidates.push(room);
-          }
-        }
-        if (candidates.length === 0) return new Response(JSON.stringify({ error: 'no_lobby_rooms' }), { status: 404, headers: corsHeaders });
-        const pick = candidates[Math.floor(Math.random() * candidates.length)];
-        // join that room via its DO
-        const roomId = pick.roomId;
-        const objId = env.GAME_ROOMS.idFromName(roomId);
-        const obj = env.GAME_ROOMS.get(objId);
-        const joinReq = new Request('https://do/joinRoom', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId, name }) });
-        const joinRes = await obj.fetch(joinReq);
-        const joinData = await joinRes.json().catch(() => ({}));
-        return new Response(JSON.stringify({ ok: true, room: joinData.room || joinData }), { headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) });
+      const pick = candidates[0];
+      const roomId = pick.roomId;
+      const objId = env.GAME_ROOMS.idFromName(roomId);
+      const obj = env.GAME_ROOMS.get(objId);
+      const joinReq = new Request('https://do/joinRoom', { 
+        method: 'POST', 
+        headers: { 'Content-Type': 'application/json' }, 
+        body: JSON.stringify({ playerId, name }) 
+      });
+      const joinRes = await obj.fetch(joinReq);
+      const joinData = await joinRes.json().catch(() => ({}));
+      return new Response(JSON.stringify({ ok: true, room: joinData.room || joinData }), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
       }
 
       if (segments[0] === 'rooms' && segments[1]) {
