@@ -96,6 +96,14 @@ export class GameRoom {
   }
 
   async fetch(request) {
+    if (request.method === 'POST' && request.url.endsWith('/delete')) {
+      // Delete this room's storage
+      await this.state.storage.deleteAll();
+      return new Response(JSON.stringify({ ok: true, message: 'Room deleted' }), { 
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+
     await this._load();
     if (request.headers.get('Upgrade') === 'websocket') {
       return this._handleWebSocket(request);
@@ -167,12 +175,21 @@ export class GameRoom {
     this.room.private = body.private || false;
     this.room.createdAt = now;
     this.room.phase = 'LOBBY';
+    
+    // Add creator as first player if provided
+    if (body.creatorName && body.creatorPlayerId) {
+      this.room.players.push({ 
+        id: body.creatorPlayerId, 
+        name: body.creatorName, 
+        joinedAt: now 
+      });
+    }
+    
     await this._save();
     return this._response({ ok: true, roomId: this.room.roomId });
   }
 
   async _handleJoin(request) {
-
     if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 30 * 60 * 1000) {
       // Remove old room from index
       try {
@@ -186,17 +203,20 @@ export class GameRoom {
           }));
         }
       } catch (e) {}
+      this.room.removedAt = this._now();
+      await this._save();
       return this._response({ error: 'room_too_old' }, 410);
     }
     if (this.room.closed) {
-        return this._response({ error: 'room_closed' }, 410);
+      return this._response({ error: 'room_closed' }, 410);
     }
-
     const body = await request.json();
     const { playerId, name } = body;
     if (!playerId) return this._response({ error: 'playerId_required' }, 400);
     if (this.room.phase !== 'LOBBY') return this._response({ error: 'not_in_lobby' }, 400);
-    if (this.room.players.find(p => p.id === playerId)) return this._response({ ok: true, room: this.room });
+    if (this.room.players.find(p => p.id === playerId)) {
+      return this._response({ ok: true, room: this.room });
+    }
     if (this.room.players.length >= this.room.maxPlayers) return this._response({ error: 'room_full' }, 400);
     this.room.players.push({ id: playerId, name: name || null, joinedAt: this._now() });
     await this._save();
@@ -409,7 +429,7 @@ export class GameRoom {
         this.room.phase = 'FINISHED';
         this.room.winnerId = null;
         this.room.clocks.frozenAt = now;
-        this.room.rematchWindowEnds = this._now() + 60 * 1000;
+        this.room.rematchWindowEnds = this._now() + 10 * 1000;
         this.room.rematchVotes = {};
         await this._save();
         return this._response({
@@ -628,6 +648,9 @@ export class GameRoom {
       const players = (this.room.players || []).map(p => p.id);
       const votes = this.room.rematchVotes || {};
       const bothAgreed = players.length > 0 && players.every(pid => votes[pid] === true);
+      const anyNo = players.some(pid => votes[pid] === false);
+      const yesVotes = players.filter(pid => votes[pid] === true);
+      
       if (!bothAgreed) {
         try {
           if (this.env?.ROOM_INDEX) {
@@ -640,6 +663,35 @@ export class GameRoom {
             }));
           }
         } catch (e) {}
+        
+        // If someone voted Yes but timeout occurred, add them to matchmaking
+        if (yesVotes.length > 0 && !anyNo) {
+          // Add the Yes voters to matchmaking queue
+          for (const yesVoterId of yesVotes) {
+            try {
+              if (this.env?.ROOM_INDEX) {
+                const indexId = this.env.ROOM_INDEX.idFromName('index');
+                const obj = this.env.ROOM_INDEX.get(indexId);
+                await obj.fetch(new Request('https://do/update', {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    roomId: this.room.roomId,
+                    phase: 'LOBBY',
+                    maxPlayers: 2,
+                    private: false,
+                    updatedAt: now
+                  }),
+                  headers: { 'Content-Type': 'application/json' }
+                }));
+              }
+            } catch (e) {}
+          }
+        }
+        
+        this.room.closed = true;
+        this.room.closeReason = anyNo ? 'declined_rematch' : 'rematch_timeout';
+        this.room.closedAt = now;
+        await this._save();
       }
     }
 
@@ -656,11 +708,18 @@ export class GameRoom {
     if (!this.room.rematchWindowEnds || this._now() > this.room.rematchWindowEnds) return this._response({ error: 'rematch_window_closed' }, 400);
 
     this.room.rematchVotes = this.room.rematchVotes || {};
+    
+    // Check if player already voted (votes are irreversible)
+    if (typeof this.room.rematchVotes[playerId] !== 'undefined') {
+      return this._response({ error: 'already_voted' }, 400);
+    }
+    
     this.room.rematchVotes[playerId] = !!agree;
     await this._save();
 
     const players = (this.room.players || []).map(p => p.id);
     const allAgreed = players.length > 0 && players.every(pid => this.room.rematchVotes[pid] === true);
+    
     if (allAgreed) {
       // reset to lobby for re-bidding
       this.room.phase = 'LOBBY';
@@ -681,6 +740,20 @@ export class GameRoom {
       this.room.rematchVotes = null;
       await this._save();
       return this._response({ ok: true, rematchStarted: true, room: this.room });
+    }
+
+    // Check if any player voted No - if so, they should be sent back to lobby
+    const anyNo = players.some(pid => this.room.rematchVotes[pid] === false);
+    if (anyNo) {
+      return this._response({ ok: true, rematchStarted: false, voteResult: 'no_vote', votes: this.room.rematchVotes });
+    }
+
+    // Check if only one player voted Yes and the other hasn't voted yet
+    const yesVotes = players.filter(pid => this.room.rematchVotes[pid] === true);
+    const noVotes = players.filter(pid => this.room.rematchVotes[pid] === false);
+    
+    if (yesVotes.length === 1 && noVotes.length === 0) {
+      return this._response({ ok: true, rematchStarted: false, voteResult: 'waiting_for_opponent', votes: this.room.rematchVotes });
     }
 
     return this._response({ ok: true, rematchStarted: false, votes: this.room.rematchVotes });
@@ -746,6 +819,10 @@ export class RoomIndex {
       await this._saveAll(rooms);
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
+    if (request.method === 'POST' && request.url.endsWith('/clear')) {
+      await this._saveAll({});
+      return new Response(JSON.stringify({ ok: true, message: 'All rooms cleared from index' }), { headers: { 'Content-Type': 'application/json' } });
+    }
     if (request.method === 'GET' && request.url.endsWith('/list')) {
       const rooms = await this._getAll();
       const list = Object.values(rooms).filter(r => r.phase !== 'FINISHED');
@@ -767,7 +844,56 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
 
     try {
-      if (request.method === 'POST' && url.pathname === '/rooms') {
+      if (request.method === 'POST' && url.pathname === '/rooms/clear-all') {
+      // TESTING ONLY: Clear all rooms and reset index
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no room index' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      try {
+        // Get all rooms from index
+        const indexId = env.ROOM_INDEX.idFromName('index');
+        const indexObj = env.ROOM_INDEX.get(indexId);
+        const listRes = await indexObj.fetch(new Request('https://do/list'));
+        const listData = await listRes.json().catch(() => ({ rooms: [] }));
+        const rooms = listData.rooms || [];
+        
+        // Delete each room's Durable Object storage
+        for (const room of rooms) {
+          try {
+            const roomId = room.roomId;
+            const objId = env.GAME_ROOMS.idFromName(roomId);
+            const obj = env.GAME_ROOMS.get(objId);
+            await obj.fetch(new Request('https://do/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' }
+            }));
+          } catch (e) {
+            console.error('Failed to delete room:', room.roomId, e);
+          }
+        }
+        
+        // Clear the room index
+        await indexObj.fetch(new Request('https://do/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        }));
+        
+        return new Response(JSON.stringify({ ok: true, message: `All rooms cleared (${rooms.length} rooms deleted)` }), { 
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Failed to clear rooms', details: e.message }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/rooms') {
         const body = await request.json().catch(() => ({}));
         const roomId = body.roomId || `room-${crypto.randomUUID()}`;
         const id = env.GAME_ROOMS.idFromName(roomId);
@@ -833,7 +959,7 @@ export default {
       return new Response(JSON.stringify({ ok: true, room: joinData.room || joinData }), { 
         headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
       });
-      }
+    }
 
     if (request.method === 'GET' && url.pathname === '/rooms/available-count') {
       if (!env.ROOM_INDEX) {
