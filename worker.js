@@ -54,6 +54,7 @@ export class GameRoom {
       bidDurationMs: 10000,
       choiceDurationMs: 10000,
       mainTimeMs: 300000,
+      private: false,
       
       closed: false,
       closeReason: null,
@@ -61,7 +62,7 @@ export class GameRoom {
 
       disconnectedPlayerId: null,
       disconnectStart: null,
-      disconnectTimeoutMs: 45000, // 45 seconds
+      disconnectTimeoutMs: 45000,
     };
   }
 
@@ -76,6 +77,7 @@ export class GameRoom {
         roomId: this.room.roomId,
         phase: this.room.phase,
         players: (this.room.players || []).length,
+        private: this.room.private || false,
         updatedAt: this.room.updatedAt || this._now()
       };
       await obj.fetch(new Request('https://do/update', { method: 'POST', body: JSON.stringify(meta), headers: { 'Content-Type': 'application/json' } }));
@@ -130,9 +132,8 @@ export class GameRoom {
     const [client, server] = Object.values(webSocketPair);
 
     server.accept();
-    server.serializeAttachment({ playerId });  // Store playerId for identification on wake-up
+    server.serializeAttachment({ playerId });
 
-    // track this server socket for broadcasts while the DO instance is alive
     try {
       this._sockets.add(server);
       server.addEventListener('close', () => {
@@ -140,10 +141,8 @@ export class GameRoom {
       });
     } catch (e) {}
 
-    // Send initial state immediately
     server.send(JSON.stringify({ type: 'init', room: this.room }));
 
-    // No need for manual close listener - runtime handles hibernation
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -152,9 +151,7 @@ export class GameRoom {
     for (const ws of this._sockets) {
       try {
         if (ws && ws.readyState === 1) ws.send(msg);
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     }
   }
 
@@ -167,6 +164,7 @@ export class GameRoom {
     this.room.bidDurationMs = body.bidDurationMs || this.room.bidDurationMs;
     this.room.choiceDurationMs = body.choiceDurationMs || this.room.choiceDurationMs;
     this.room.mainTimeMs = body.mainTimeMs || this.room.mainTimeMs;
+    this.room.private = body.private || false;
     this.room.createdAt = now;
     this.room.phase = 'LOBBY';
     await this._save();
@@ -175,7 +173,19 @@ export class GameRoom {
 
   async _handleJoin(request) {
 
-    if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 1 * 60 * 60 * 1000) {
+    if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 30 * 60 * 1000) {
+      // Remove old room from index
+      try {
+        if (this.env?.ROOM_INDEX) {
+          const indexId = this.env.ROOM_INDEX.idFromName('index');
+          const obj = this.env.ROOM_INDEX.get(indexId);
+          await obj.fetch(new Request('https://do/remove', {
+            method: 'POST',
+            body: JSON.stringify({ roomId: this.room.roomId }),
+            headers: { 'Content-Type': 'application/json' }
+          }));
+        }
+      } catch (e) {}
       return this._response({ error: 'room_too_old' }, 410);
     }
     if (this.room.closed) {
@@ -194,7 +204,6 @@ export class GameRoom {
   }
 
   async _handleStartBidding(request) {
-    // Two-step start: first press requests bidding start, other player must confirm within choiceDurationMs (default 60s)
     const body = await request.json().catch(() => ({}));
     const { playerId } = body;
     if (!playerId) return this._response({ error: 'playerId_required' }, 400);
@@ -202,11 +211,8 @@ export class GameRoom {
     if (this.room.players.length !== this.room.maxPlayers) return this._response({ error: 'need_more_players' }, 400);
     const now = this._now();
 
-    // if there's already a pending start request
     if (this.room.startRequestedBy && this.room.startConfirmDeadline) {
-      // if same player presses again, ignore
       if (this.room.startRequestedBy === playerId) return this._response({ ok: true, message: 'already_requested' });
-      // if within deadline, begin bidding
       if (now <= this.room.startConfirmDeadline) {
         this.room.phase = 'BIDDING';
         this.room.bidDeadline = now + this.room.bidDurationMs;
@@ -218,20 +224,17 @@ export class GameRoom {
         this.room.drawOddsSide = null;
         this.room.choiceAttempts = 0;
         this.room.currentPicker = null;
-        // clear start request
         this.room.startRequestedBy = null;
         this.room.startConfirmDeadline = null;
         await this._save();
         return this._response({ ok: true, bidDeadline: this.room.bidDeadline });
       }
-      // deadline passed - clear and revert
       this.room.startRequestedBy = null;
       this.room.startConfirmDeadline = null;
       await this._save();
       return this._response({ error: 'start_request_expired' }, 400);
     }
 
-    // create a start request and set a confirm deadline
     this.room.startRequestedBy = playerId;
     this.room.startConfirmDeadline = now + (this.room.choiceDurationMs || 60 * 1000);
     await this._save();
@@ -273,10 +276,8 @@ export class GameRoom {
     const b2 = bids[p2];
     const deadlinePassed = this.room.bidDeadline && now > this.room.bidDeadline;
 
-    // Wait until both players have bid or deadline passed
     if (!b1 || !b2) {
       if (!deadlinePassed) return;
-      // Fill missing bids with max time
       if (!b1) bids[p1] = { amount: this.room.mainTimeMs, submittedAt: now };
       if (!b2) bids[p2] = { amount: this.room.mainTimeMs, submittedAt: now };
     }
@@ -375,15 +376,12 @@ export class GameRoom {
 
     const now = this._now();
 
-    // If this player was previously disconnected, clear disconnect state
     if (this.room.disconnectedPlayerId === playerId) {
       this.room.disconnectedPlayerId = null;
       this.room.disconnectStart = null;
     }
-    // Mark this player as active (heartbeat)
     this.room.updatedAt = now;
 
-    // Initialize or restore chess game from FEN *before* clock timeout logic
     const game = new Chess(this.room.gameFen || undefined);
 
     const elapsed = now - (this.room.clocks.lastTickAt || now);
@@ -394,7 +392,6 @@ export class GameRoom {
     const blackFlagged = this.room.clocks.blackRemainingMs <= 0;
 
     if ((playerColor === 'white' && whiteFlagged) || (playerColor === 'black' && blackFlagged)) {
-      // Time expired for the moving side: check if opponent has mating material
       const opponentColorLetter = playerColor === 'white' ? 'b' : 'w';
 
       const pieces = game.board().flat().filter(Boolean);
@@ -409,7 +406,6 @@ export class GameRoom {
       const canEverMate = hasMajorOrPawn || hasMultipleMinors;
 
       if (!canEverMate) {
-        // Flag fell but opponent cannot possibly checkmate: draw
         this.room.phase = 'FINISHED';
         this.room.winnerId = null;
         this.room.clocks.frozenAt = now;
@@ -426,7 +422,6 @@ export class GameRoom {
         });
       }
 
-      // Normal time-forfeit win
       const winnerId = this.room.players.find(p => this.room.colors[p.id] !== playerColor)?.id || null;
       this.room.phase = 'FINISHED';
       this.room.winnerId = winnerId;
@@ -474,7 +469,6 @@ export class GameRoom {
       });
     }
 
-    // Draw conditions (stalemate, insufficient material, threefold, 50-move)
     let drawReason = null;
     if (game.isStalemate()) drawReason = 'stalemate';
     else if (game.isInsufficientMaterial()) drawReason = 'insufficient_material';
@@ -509,10 +503,8 @@ export class GameRoom {
     if (this.room.phase !== 'PLAYING') return this._response({ error: 'invalid_phase' }, 400);
     if (!timedOutPlayerId) return this._response({ error: 'timedOutPlayerId_required' }, 400);
 
-    // Reconstruct game to inspect material
     const game = new Chess(this.room.gameFen || undefined);
 
-    // Identify opponent
     const opponent = this.room.players.find(p => p.id !== timedOutPlayerId) || null;
     const opponentId = opponent ? opponent.id : null;
     const opponentColor = opponentId && this.room.colors ? this.room.colors[opponentId] : null;
@@ -565,15 +557,25 @@ export class GameRoom {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
 
-    if (this.room.updatedAt && (now - this.room.updatedAt) > 12 * 60 * 60 * 1000) {
+    if (this.room.updatedAt && (now - this.room.updatedAt) > 30 * 60 * 1000) {
+      // Remove expired room from index
+      try {
+        if (this.env?.ROOM_INDEX) {
+          const indexId = this.env.ROOM_INDEX.idFromName('index');
+          const obj = this.env.ROOM_INDEX.get(indexId);
+          await obj.fetch(new Request('https://do/remove', {
+            method: 'POST',
+            body: JSON.stringify({ roomId: this.room.roomId }),
+            headers: { 'Content-Type': 'application/json' }
+          }));
+        }
+      } catch (e) {}
       await this.state.storage.delete('room');
       return this._response({ error: 'room_expired' }, 410);
     }
 
     if (this.room.phase === 'PLAYING') {
-      // Detect new disconnect (no activity in 10s)
       if (!this.room.disconnectedPlayerId && (now - (this.room.updatedAt || 0)) > 10000) {
-        // Find the inactive player (opposite of current turn)
         const activePlayerId = Object.keys(this.room.colors || {}).find(id => 
           this.room.colors[id] === this.room.clocks.turn
         );
@@ -585,7 +587,6 @@ export class GameRoom {
         }
       }
 
-      // Auto-forfeit after 45s disconnect
       if (this.room.disconnectedPlayerId && this.room.disconnectStart && 
           (now - this.room.disconnectStart) > this.room.disconnectTimeoutMs) {
         const winnerId = this.room.disconnectedPlayerId === Object.keys(this.room.colors || {})[0] ? 
@@ -597,7 +598,6 @@ export class GameRoom {
       }
     }
 
-    // Close room if start request expired
     if (!this.room.closed && this.room.startConfirmDeadline && now > this.room.startConfirmDeadline) {
       this.room.startRequestedBy = null;
       this.room.startConfirmDeadline = null;
@@ -607,7 +607,6 @@ export class GameRoom {
       saveNeeded = true;
     }
 
-    // Remove room from index if closed >10 minutes
     if (this.room.closed && this.room.closeReason === 'start_expired' && this.room.closedAt && (now - this.room.closedAt) > 10 * 60 * 1000) {
       try {
         if (this.env?.ROOM_INDEX) {
@@ -780,7 +779,8 @@ export default {
             maxPlayers: body.maxPlayers,
             bidDurationMs: body.bidDurationMs,
             choiceDurationMs: body.choiceDurationMs,
-            mainTimeMs: body.mainTimeMs
+            mainTimeMs: body.mainTimeMs,
+            private: body.private || false
           }),
           headers: { 'Content-Type': 'application/json' }
         });
@@ -809,7 +809,8 @@ export default {
 
       const candidates = rooms.filter(r => 
         r.phase === 'LOBBY' && 
-        r.players < 2
+        r.players < 2 &&
+        !r.private  // Exclude private rooms from quick match
       );
       if (candidates.length === 0) {
         return new Response(JSON.stringify({ error: 'no_lobby_rooms' }), { 
@@ -830,6 +831,30 @@ export default {
       const joinRes = await obj.fetch(joinReq);
       const joinData = await joinRes.json().catch(() => ({}));
       return new Response(JSON.stringify({ ok: true, room: joinData.room || joinData }), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+      }
+
+    if (request.method === 'GET' && url.pathname === '/rooms/available-count') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ count: 0 }), { 
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      const listRes = await idxObj.fetch(new Request('https://do/list'));
+      const listData = await listRes.json().catch(() => ({ rooms: [] }));
+      const rooms = listData.rooms || [];
+
+      const availableRooms = rooms.filter(r => 
+        r.phase === 'LOBBY' && 
+        r.players < 2 &&
+        !r.private  // Exclude private rooms
+      );
+      
+      return new Response(JSON.stringify({ count: availableRooms.length }), { 
         headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
       });
       }
