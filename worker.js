@@ -76,12 +76,22 @@ export class GameRoom {
       const meta = {
         roomId: this.room.roomId,
         phase: this.room.phase,
-        players: (this.room.players || []).length,
+        players: this.room.players || [],
         private: this.room.private || false,
-        updatedAt: this.room.updatedAt || this._now()
+        updatedAt: this.room.updatedAt || this._now(),
+        clocks: this.room.clocks,
+        mainTimeMs: this.room.mainTimeMs,
+        liveWhiteMs: this.room.clocks?.whiteRemainingMs,
+        liveBlackMs: this.room.clocks?.blackRemainingMs
       };
-      await obj.fetch(new Request('https://do/update', { method: 'POST', body: JSON.stringify(meta), headers: { 'Content-Type': 'application/json' } }));
-    } catch (e) {}
+      await obj.fetch(new Request('https://do/update', {
+        method: 'POST',
+        body: JSON.stringify(meta),
+        headers: { 'Content-Type': 'application/json' }
+      }));
+    } catch (e) {
+      // Handle index update failures silently
+    }
   }
 
   async _save() {
@@ -97,7 +107,6 @@ export class GameRoom {
 
   async fetch(request) {
     if (request.method === 'POST' && request.url.endsWith('/delete')) {
-      // Delete this room's storage
       await this.state.storage.deleteAll();
       return new Response(JSON.stringify({ ok: true, message: 'Room deleted' }), { 
         headers: { 'Content-Type': 'application/json' } 
@@ -176,7 +185,6 @@ export class GameRoom {
     this.room.createdAt = now;
     this.room.phase = 'LOBBY';
     
-    // Add creator as first player if provided
     if (body.creatorName && body.creatorPlayerId) {
       this.room.players.push({ 
         id: body.creatorPlayerId, 
@@ -185,13 +193,25 @@ export class GameRoom {
       });
     }
     
+    if (body.queuedPlayers && Array.isArray(body.queuedPlayers)) {
+      for (const queuedPlayer of body.queuedPlayers) {
+        if (!this.room.players.some(p => p.id === queuedPlayer.playerId)) {
+          this.room.players.push({
+            id: queuedPlayer.playerId,
+            name: queuedPlayer.name,
+            joinedAt: now
+          });
+        }
+      }
+    }
+    
     await this._save();
     return this._response({ ok: true, roomId: this.room.roomId });
   }
 
   async _handleJoin(request) {
+    console.log('🚪 _handleJoin called for room:', this.room?.roomId);
     if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 30 * 60 * 1000) {
-      // Remove old room from index
       try {
         if (this.env?.ROOM_INDEX) {
           const indexId = this.env.ROOM_INDEX.idFromName('index');
@@ -363,6 +383,7 @@ export class GameRoom {
     this.room.drawOddsSide = blackPlayerId;
     this.room.phase = 'PLAYING';
     await this._save();
+    await this._indexUpdate();
     return this._response({ ok: true, clocks: this.room.clocks });
   }
 
@@ -493,7 +514,7 @@ export class GameRoom {
     if (game.isStalemate()) drawReason = 'stalemate';
     else if (game.isInsufficientMaterial()) drawReason = 'insufficient_material';
     else if (game.isThreefoldRepetition()) drawReason = 'threefold_repetition';
-    else if (game.isFiftyMoves()) drawReason = 'fifty_move_rule';
+    else if (game.isDraw()) drawReason = 'draw'; // This includes fifty-move rule
 
     if (drawReason) {
       this.room.phase = 'FINISHED';
@@ -513,6 +534,7 @@ export class GameRoom {
     }
 
     await this._save();
+    await this._indexUpdate();
     return this._response({ ok: true, clocks: this.room.clocks, moves: this.room.moves });
   }
 
@@ -578,7 +600,6 @@ export class GameRoom {
     await this._resolveChoiceIfNeeded();
 
     if (this.room.updatedAt && (now - this.room.updatedAt) > 30 * 60 * 1000) {
-      // Remove expired room from index
       try {
         if (this.env?.ROOM_INDEX) {
           const indexId = this.env.ROOM_INDEX.idFromName('index');
@@ -643,7 +664,6 @@ export class GameRoom {
       saveNeeded = true;
     }
 
-    // Cleanup rematch window expiry for finished games
     if (this.room.phase === 'FINISHED' && this.room.rematchWindowEnds && now > this.room.rematchWindowEnds) {
       const players = (this.room.players || []).map(p => p.id);
       const votes = this.room.rematchVotes || {};
@@ -664,9 +684,7 @@ export class GameRoom {
           }
         } catch (e) {}
         
-        // If someone voted Yes but timeout occurred, add them to matchmaking
         if (yesVotes.length > 0 && !anyNo) {
-          // Add the Yes voters to matchmaking queue
           for (const yesVoterId of yesVotes) {
             try {
               if (this.env?.ROOM_INDEX) {
@@ -679,6 +697,7 @@ export class GameRoom {
                     phase: 'LOBBY',
                     maxPlayers: 2,
                     private: false,
+                    players: this.room.players,
                     updatedAt: now
                   }),
                   headers: { 'Content-Type': 'application/json' }
@@ -709,7 +728,6 @@ export class GameRoom {
 
     this.room.rematchVotes = this.room.rematchVotes || {};
     
-    // Check if player already voted (votes are irreversible)
     if (typeof this.room.rematchVotes[playerId] !== 'undefined') {
       return this._response({ error: 'already_voted' }, 400);
     }
@@ -721,7 +739,6 @@ export class GameRoom {
     const allAgreed = players.length > 0 && players.every(pid => this.room.rematchVotes[pid] === true);
     
     if (allAgreed) {
-      // reset to lobby for re-bidding
       this.room.phase = 'LOBBY';
       this.room.bids = {};
       this.room.bidDeadline = null;
@@ -742,13 +759,11 @@ export class GameRoom {
       return this._response({ ok: true, rematchStarted: true, room: this.room });
     }
 
-    // Check if any player voted No - if so, they should be sent back to lobby
     const anyNo = players.some(pid => this.room.rematchVotes[pid] === false);
     if (anyNo) {
       return this._response({ ok: true, rematchStarted: false, voteResult: 'no_vote', votes: this.room.rematchVotes });
     }
 
-    // Check if only one player voted Yes and the other hasn't voted yet
     const yesVotes = players.filter(pid => this.room.rematchVotes[pid] === true);
     const noVotes = players.filter(pid => this.room.rematchVotes[pid] === false);
     
@@ -788,7 +803,6 @@ export class GameRoom {
 
 }
 
-// Durable Object to track active rooms for matchmaking
 export class RoomIndex {
   constructor(state, env) {
     this.state = state;
@@ -804,11 +818,154 @@ export class RoomIndex {
     await this.state.storage.put('rooms', obj);
   }
 
+  async _cleanupStaleQueues(queues) {
+    const now = Date.now();
+    const STALE_TIME = 5 * 60 * 1000;
+    
+    for (const timeKey in queues) {
+      const originalLength = queues[timeKey].length;
+      queues[timeKey] = queues[timeKey].filter(player => {
+        const lastActivity = player.lastHeartbeat || player.joinedAt;
+        return (now - lastActivity) < STALE_TIME;
+      });
+      
+      if (queues[timeKey].length < originalLength) {
+        console.log(`Cleaned ${originalLength - queues[timeKey].length} stale players from ${timeKey}ms queue`);
+      }
+    }
+    
+    await this.state.storage.put('queues', queues);
+  }
+
+  async _getEstimatedWaitTimes() {
+    const rooms = await this._getAll();
+    const queues = await this.state.storage.get('queues') || {};
+    const estimates = {};
+    const now = Date.now();
+    
+    for (const timeControl of TIME_CONTROLS) {
+      const timeMs = timeControl.ms;
+      const timeKey = timeMs.toString();
+      const queueLength = queues[timeKey]?.length || 0;
+      
+      const activeGames = Object.values(rooms).filter(room => 
+        room.mainTimeMs === timeMs && 
+        room.phase === 'PLAYING' &&
+        room.players?.length === 2
+      );
+      
+      let estimateData = {
+        type: 'none',
+        message: 'No games in place - no available estimate'
+      };
+      
+      if (queueLength >= 1) {
+        estimateData = {
+          type: 'match_now',
+          message: 'Match NOW!'
+        };
+      } else if (queueLength === 0 && activeGames.length > 0) {
+        // Find game with shortest time remaining
+        let minRemainingTime = Infinity;
+        let shortestGame = null;
+        
+        for (const game of activeGames) {
+          // Try multiple clock field locations, fallback to time-based estimation
+          const whiteTime = game.liveWhiteMs || game.clocks?.whiteRemainingMs || game.whiteTime || 0;
+          const blackTime = game.liveBlackMs || game.clocks?.blackRemainingMs || game.blackTime || 0;
+          
+          let minPlayerTime;
+          if (whiteTime > 0 || blackTime > 0) {
+            // Use actual clock data if available
+            minPlayerTime = Math.min(whiteTime, blackTime);
+          } else {
+            // Without real clock data, we can't accurately estimate chess clock time
+            // Chess clocks are move-based, not elapsed time based
+            // Just show that a game is active
+            minPlayerTime = (game.mainTimeMs || 300000); // Use full time as placeholder
+          }
+          
+          if (minPlayerTime < minRemainingTime) {
+            minRemainingTime = minPlayerTime;
+            shortestGame = game;
+          }
+        }
+        
+        if (minRemainingTime < Infinity && shortestGame) {
+          // Check if we have real clock data or just placeholder
+          const hasRealClockData = (shortestGame.liveWhiteMs || shortestGame.clocks?.whiteRemainingMs || 
+                                   shortestGame.liveBlackMs || shortestGame.clocks?.blackRemainingMs || 0) > 0;
+          
+          if (hasRealClockData) {
+            // Use real clock data for countdown
+            const anchorKey = `estimate_anchor_${timeKey}`;
+            const anchorData = await this.state.storage.get(anchorKey);
+            
+            if (!anchorData || anchorData.gameId !== shortestGame.roomId) {
+              // Create new anchor
+              const newAnchor = {
+                gameId: shortestGame.roomId,
+                startTime: now,
+                durationMs: minRemainingTime,
+                timeControlMs: timeMs
+              };
+              await this.state.storage.put(anchorKey, newAnchor);
+              
+              estimateData = {
+                type: 'countdown',
+                startTime: now,
+                durationMs: minRemainingTime,
+                message: `Next game in ~${Math.ceil(minRemainingTime / 60000)} min`
+              };
+            } else {
+              // Use existing anchor - countdown continues
+              const elapsed = now - anchorData.startTime;
+              const remaining = Math.max(0, anchorData.durationMs - elapsed);
+              
+              estimateData = {
+                type: 'countdown',
+                startTime: anchorData.startTime,
+                durationMs: anchorData.durationMs,
+                message: `Next game in ~${Math.ceil(remaining / 60000)} min`
+              };
+            }
+          } else {
+            estimateData = {
+              type: 'games_active',
+              message: `${activeGames.length} game${activeGames.length > 1 ? 's' : ''} in progress`
+            };
+          }
+        }
+      }
+      
+      estimates[timeKey] = {
+        queueLength,
+        activeGames: activeGames.length,
+        estimate: estimateData
+      };
+    }
+    
+    return estimates;
+  }
+
   async fetch(request) {
     if (request.method === 'POST' && request.url.endsWith('/update')) {
       const body = await request.json().catch(() => ({}));
       const rooms = await this._getAll();
-      rooms[body.roomId] = { roomId: body.roomId, phase: body.phase, players: body.players || 0, updatedAt: body.updatedAt || Date.now() };
+      const existingRoom = rooms[body.roomId] || {};
+      
+      rooms[body.roomId] = { 
+        ...existingRoom,
+        roomId: body.roomId, 
+        phase: body.phase, 
+        players: body.players !== undefined ? body.players : (existingRoom.players || []),
+        updatedAt: body.updatedAt || Date.now(),
+        clocks: body.clocks,
+        mainTimeMs: body.mainTimeMs,
+        liveWhiteMs: body.liveWhiteMs,
+        liveBlackMs: body.liveBlackMs
+      };
+      
       await this._saveAll(rooms);
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -828,12 +985,481 @@ export class RoomIndex {
       const list = Object.values(rooms).filter(r => r.phase !== 'FINISHED');
       return new Response(JSON.stringify({ ok: true, rooms: list }), { headers: { 'Content-Type': 'application/json' } });
     }
+    
+    if (request.method === 'POST' && request.url.endsWith('/joinAll')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerId, name } = body;
+      
+      const queues = await this.state.storage.get('queues') || {};
+      
+      // Add player to all time control queues (don't remove from existing)
+      for (const timeControl of TIME_CONTROLS) {
+        const timeKey = timeControl.ms.toString();
+        if (!queues[timeKey]) {
+          queues[timeKey] = [];
+        }
+        
+        // Check if player already in this queue
+        const alreadyInQueue = queues[timeKey].some(p => p.playerId === playerId);
+        if (!alreadyInQueue) {
+          queues[timeKey].push({ 
+            playerId, 
+            name, 
+            joinedAt: Date.now(), 
+            lastHeartbeat: Date.now() 
+          });
+        } else {
+          // Update heartbeat if already in queue
+          const player = queues[timeKey].find(p => p.playerId === playerId);
+          if (player) {
+            player.lastHeartbeat = Date.now();
+          }
+        }
+      }
+      
+      await this.state.storage.put('queues', queues);
+      
+      // Clean up stale players before checking for matches
+      await this._cleanupStaleQueues(queues);
+      
+      // Check if any queue has 2 players to create a room
+      console.log('🔍 Checking all queues for matches after joinAll...');
+      for (const timeControl of TIME_CONTROLS) {
+        const timeKey = timeControl.ms.toString();
+        console.log(`📊 Queue ${timeKey}: ${queues[timeKey].length} players`);
+        if (queues[timeKey].length >= 2) {
+          const queuedPlayers = queues[timeKey].slice(0, 2);
+          console.log('🏠 Found match in joinAll:', queuedPlayers);
+          return new Response(JSON.stringify({ 
+            shouldCreateRoom: true, 
+            mainTimeMs: timeControl.ms, 
+            queuedPlayers 
+          }), { headers: { 'Content-Type': 'application/json' } });
+        }
+      }
+      
+      return new Response(JSON.stringify({ 
+        ok: true, 
+        queued: true,
+        joinedQueues: TIME_CONTROLS.map(tc => tc.minutes)
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/addToQueue')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerId, name, mainTimeMs } = body;
+      
+      console.log('🎯 addToQueue called:', { playerId, name, mainTimeMs });
+      
+      const queues = await this.state.storage.get('queues') || {};
+      const timeKey = mainTimeMs.toString();
+      
+      console.log('📊 Current queues before:', JSON.stringify(queues));
+      
+      if (!queues[timeKey]) {
+        queues[timeKey] = [];
+      }
+      
+      // Check if player already in this queue
+      const alreadyInQueue = queues[timeKey].some(p => p.playerId === playerId);
+      if (!alreadyInQueue) {
+        queues[timeKey].push({ playerId, name, joinedAt: Date.now(), lastHeartbeat: Date.now() });
+        console.log('➕ Player added to queue:', timeKey);
+      } else {
+        // Update heartbeat if already in queue
+        const player = queues[timeKey].find(p => p.playerId === playerId);
+        if (player) {
+          player.lastHeartbeat = Date.now();
+          console.log('💓 Player heartbeat updated:', timeKey);
+        }
+      }
+      
+      await this.state.storage.put('queues', queues);
+      console.log('💾 Queues saved:', JSON.stringify(queues));
+      
+      // Clean up stale players before checking for matches
+      await this._cleanupStaleQueues(queues);
+      console.log('🧹 After cleanup:', JSON.stringify(queues));
+      
+      // Check if we have 2 players to create a room
+      if (queues[timeKey].length >= 2) {
+        const queuedPlayers = queues[timeKey].slice(0, 2);
+        console.log('🏠 Creating room with players:', queuedPlayers);
+        return new Response(JSON.stringify({ 
+          shouldCreateRoom: true, 
+          mainTimeMs, 
+          queuedPlayers 
+        }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      
+      console.log('⏳ Player queued, position:', queues[timeKey].findIndex(p => p.playerId === playerId) + 1);
+      return new Response(JSON.stringify({ 
+        ok: true, 
+        queued: true, 
+        queuePosition: queues[timeKey].findIndex(p => p.playerId === playerId) + 1 
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/debugQueues')) {
+      const queues = await this.state.storage.get('queues') || {};
+      console.log('🔍 Debug: All queues:', JSON.stringify(queues, null, 2));
+      return new Response(JSON.stringify({ 
+        queues,
+        totalQueued: Object.values(queues).reduce((sum, queue) => sum + queue.length, 0)
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/debugRooms')) {
+      const rooms = await this._getAll();
+      console.log('🔍 Debug: All rooms:', rooms);
+      return new Response(JSON.stringify({ 
+        rooms,
+        count: Object.keys(rooms).length
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/checkMatch')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      
+      const queues = await this.state.storage.get('queues') || {};
+      const rooms = await this._getAll();
+      
+      console.log('🔍 checkMatch called for:', playerId);
+      
+      // Check if player is in any active room
+      console.log('🏠 Checking rooms for player:', playerId);
+      console.log('🏠 Available rooms:', Object.keys(rooms));
+      
+      for (const room of Object.values(rooms)) {
+        console.log('🏠 Checking room:', room.roomId, 'players:', room.players);
+        if (room.players && Array.isArray(room.players)) {
+          // Check both possible player ID field names
+          const foundInRoom = room.players.some(p => {
+            console.log('🔍 Checking player:', p, 'against:', playerId);
+            return p.id === playerId || p.playerId === playerId;
+          });
+          if (foundInRoom) {
+            console.log('✅ Player found in room:', room.roomId);
+            return new Response(JSON.stringify({ 
+              matched: true, 
+              roomId: room.roomId,
+              room 
+            }), { headers: { 'Content-Type': 'application/json' } });
+          }
+        }
+      }
+      
+      // Check if player is still in any queue
+      let inQueue = false;
+      for (const timeKey in queues) {
+        if (queues[timeKey].some(p => p.playerId === playerId)) {
+          inQueue = true;
+          break;
+        }
+      }
+      
+      console.log('📊 Match check result:', { matched: false, inQueue });
+      return new Response(JSON.stringify({ 
+        matched: false, 
+        inQueue 
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/heartbeat')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      
+      const queues = await this.state.storage.get('queues') || {};
+      let found = false;
+      
+      for (const timeKey in queues) {
+        const player = queues[timeKey].find(p => p.playerId === playerId);
+        if (player) {
+          player.lastHeartbeat = Date.now();
+          found = true;
+          break;
+        }
+      }
+      
+      if (found) {
+        await this.state.storage.put('queues', queues);
+      }
+      
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/removeFromAllQueues')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerIds } = body;
+      
+      if (!playerIds || !Array.isArray(playerIds)) {
+        return new Response(JSON.stringify({ error: 'playerIds_required' }), { 
+          status: 400, 
+          headers: { 'Content-Type': 'application/json' } 
+        });
+      }
+      
+      const queues = await this.state.storage.get('queues') || {};
+      
+      for (const timeKey in queues) {
+        queues[timeKey] = queues[timeKey].filter(p => !playerIds.includes(p.playerId));
+      }
+      
+      await this.state.storage.put('queues', queues);
+      
+      return new Response(JSON.stringify({ ok: true }), { 
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/updateClocks')) {
+      const body = await request.json().catch(() => ({}));
+      const { roomId, clocks } = body;
+      
+      if (!roomId || !clocks) {
+        return new Response(JSON.stringify({ error: 'roomId_and_clocks_required' }), { 
+          status: 400, 
+          headers: { 'Content-Type': 'application/json' } 
+        });
+      }
+      
+      const rooms = await this._getAll();
+      const existingRoom = rooms[roomId] || {};
+      
+      // Update the room with clock data
+      rooms[roomId] = { 
+        ...existingRoom,
+        roomId,
+        clocks,
+        updatedAt: Date.now()
+      };
+      
+      await this._putAll(rooms);
+      
+      return new Response(JSON.stringify({ ok: true }), { 
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/debugEstimates')) {
+      const rooms = await this._getAll();
+      const queues = await this.state.storage.get('queues') || {};
+      const now = Date.now();
+      
+      const debugInfo = {
+        timestamp: new Date(now).toISOString(),
+        queues: {},
+        activeGames: {},
+        anchors: {},
+        estimates: {}
+      };
+      
+      // Debug queue info
+      for (const timeControl of TIME_CONTROLS) {
+        const timeKey = timeControl.ms.toString();
+        debugInfo.queues[timeKey] = {
+          timeControl: timeControl.display,
+          queueLength: queues[timeKey]?.length || 0,
+          players: queues[timeKey] || []
+        };
+      }
+      
+      debugInfo.allRooms = {};
+      for (const [roomId, room] of Object.entries(rooms)) {
+        debugInfo.allRooms[roomId] = {
+          phase: room.phase,
+          players: room.players?.length || 0,
+          playerNames: room.players?.map(p => ({id: p.id, name: p.name})) || [],
+          mainTimeMs: room.mainTimeMs,
+          allFields: Object.keys(room).filter(key => 
+            key.toLowerCase().includes('time') || 
+            key.toLowerCase().includes('clock') ||
+            key.toLowerCase().includes('white') ||
+            key.toLowerCase().includes('black') ||
+            key.toLowerCase().includes('remaining')
+          ),
+          timeFields: {
+            liveWhiteMs: room.liveWhiteMs,
+            liveBlackMs: room.liveBlackMs,
+            clocks: room.clocks,
+            whiteTime: room.whiteTime,
+            blackTime: room.blackTime,
+            whiteRemainingMs: room.clocks?.whiteRemainingMs,
+            blackRemainingMs: room.clocks?.blackRemainingMs,
+            time: room.time,
+            turn: room.turn,
+            createdAt: room.createdAt,
+            updatedAt: room.updatedAt
+          },
+          wouldBeDetected: room.phase === 'PLAYING' && room.players?.length === 2,
+          updatedAt: new Date(room.updatedAt).toISOString(),
+          roomId: roomId
+        };
+      }
+      for (const [roomId, room] of Object.entries(rooms)) {
+        if (room.phase === 'PLAYING' && room.players?.length === 2) {
+          const timeKey = room.mainTimeMs?.toString();
+          if (timeKey) {
+            if (!debugInfo.activeGames[timeKey]) {
+              debugInfo.activeGames[timeKey] = [];
+            }
+            
+            // Try multiple clock field locations, fallback to time-based estimation
+            const whiteTime = room.liveWhiteMs || room.clocks?.whiteRemainingMs || room.whiteTime || 0;
+            const blackTime = room.liveBlackMs || room.clocks?.blackRemainingMs || room.blackTime || 0;
+            
+            let minPlayerTime;
+            let timeSource;
+            if (whiteTime > 0 || blackTime > 0) {
+              // Use actual clock data if available
+              minPlayerTime = Math.min(whiteTime, blackTime);
+              timeSource = 'clock_data';
+            } else {
+              // Without real clock data, we can't accurately estimate chess clock time
+              // Chess clocks are move-based, not elapsed time based
+              // Just show that a game is active
+              minPlayerTime = (room.mainTimeMs || 300000); // Use full time as placeholder
+              timeSource = 'game_active_placeholder';
+            }
+            
+            debugInfo.activeGames[timeKey].push({
+              roomId,
+              phase: room.phase,
+              players: room.players.map(p => ({ id: p.id, name: p.name })),
+              whiteTime: Math.round(whiteTime / 1000) + 's',
+              blackTime: Math.round(blackTime / 1000) + 's',
+              minPlayerTime: Math.round(minPlayerTime / 1000) + 's',
+              updatedAt: new Date(room.updatedAt).toISOString(),
+              // Show what clock fields we found and time source
+              timeSource,
+              clockFields: {
+                liveWhiteMs: room.liveWhiteMs,
+                liveBlackMs: room.liveBlackMs,
+                clocks: room.clocks,
+                whiteTime: room.whiteTime,
+                blackTime: room.blackTime,
+                mainTimeMs: room.mainTimeMs,
+                gameStartTime: room.updatedAt || room.createdAt,
+                elapsed: Math.round((now - (room.updatedAt || room.createdAt || Date.now())) / 1000) + 's'
+              }
+            });
+          }
+        }
+      }
+      
+      // Debug anchors
+      for (const timeControl of TIME_CONTROLS) {
+        const timeKey = timeControl.ms.toString();
+        const anchorKey = `estimate_anchor_${timeKey}`;
+        const anchorData = await this.state.storage.get(anchorKey);
+        
+        if (anchorData) {
+          debugInfo.anchors[timeKey] = {
+            gameId: anchorData.gameId,
+            startTime: new Date(anchorData.startTime).toISOString(),
+            durationMs: Math.round(anchorData.durationMs / 1000) + 's',
+            elapsedMs: Math.round((now - anchorData.startTime) / 1000) + 's',
+            remainingMs: Math.round(Math.max(0, anchorData.durationMs - (now - anchorData.startTime)) / 1000) + 's'
+          };
+        }
+      }
+      
+      // Debug final estimates
+      const estimates = await this._getEstimatedWaitTimes();
+      debugInfo.estimates = estimates;
+      
+      return new Response(JSON.stringify(debugInfo, null, 2), { 
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/cleanup')) {
+      const queues = await this.state.storage.get('queues') || {};
+      await this._cleanupStaleQueues(queues);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'GET' && request.url.endsWith('/queue-status')) {
+      const estimates = await this._getEstimatedWaitTimes();
+      console.log('📊 Queue status requested, estimates:', estimates);
+      
+      // Also log raw queue data for debugging
+      const queues = await this.state.storage.get('queues') || {};
+      console.log('📋 Raw queue data:', JSON.stringify(queues));
+      
+      return new Response(JSON.stringify({ ok: true, estimates }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/clear-all-queues')) {
+      const body = await request.json().catch(() => ({}));
+      const { mainTimeMs } = body;
+      
+      const queues = await this.state.storage.get('queues') || {};
+      
+      if (mainTimeMs) {
+        // Clear specific queue
+        const timeKey = mainTimeMs.toString();
+        if (queues[timeKey]) {
+          queues[timeKey] = [];
+        }
+      } else {
+        // Clear all queues
+        for (const timeKey in queues) {
+          queues[timeKey] = [];
+        }
+      }
+      
+      await this.state.storage.put('queues', queues);
+      return new Response(JSON.stringify({ ok: true, message: mainTimeMs ? `Queue ${mainTimeMs}ms cleared` : 'All queues cleared' }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (request.method === 'POST' && request.url.endsWith('/clearQueue')) {
+      const body = await request.json().catch(() => ({}));
+      const { mainTimeMs } = body;
+      
+      const queues = await this.state.storage.get('queues') || {};
+      const timeKey = mainTimeMs.toString();
+      
+      if (queues[timeKey]) {
+        queues[timeKey] = [];
+      }
+      
+      await this.state.storage.put('queues', queues);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    if (request.method === 'POST' && request.url.endsWith('/removeFromAllQueues')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      
+      const queues = await this.state.storage.get('queues') || {};
+      
+      for (const timeKey in queues) {
+        queues[timeKey] = queues[timeKey].filter(p => p.playerId !== playerId);
+      }
+      
+      await this.state.storage.put('queues', queues);
+      return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
     return new Response(JSON.stringify({ error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
+// Scalable time controls configuration (matches frontend)
+const TIME_CONTROLS = [
+  { minutes: 5, ms: 300000, display: '5 min' },
+  { minutes: 10, ms: 600000, display: '10 min' },
+  { minutes: 15, ms: 900000, display: '15 min' },
+  // Easy to add more time controls:
+  // { minutes: 3, ms: 180000, display: '3 min' },
+  // { minutes: 30, ms: 1800000, display: '30 min' },
+];
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const segments = url.pathname.replace(/(^\/|\/$)/g, '').split('/');
     const corsHeaders = {
@@ -844,7 +1470,75 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
 
     try {
-      if (request.method === 'POST' && url.pathname === '/rooms/clear-all') {
+      if (request.method === 'POST' && url.pathname === '/rooms/clear-all-and-queues') {
+      // TESTING ONLY: Clear all rooms, reset index, and clear all queues
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no room index' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      try {
+        // Get room IDs from the index instead of listing Durable Objects
+        const indexId = env.ROOM_INDEX.idFromName('index');
+        const indexObj = env.ROOM_INDEX.get(indexId);
+        
+        // Get all rooms from index
+        const listRes = await indexObj.fetch(new Request('https://do/list', {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' }
+        }));
+        const listData = await listRes.json().catch(() => ({ rooms: [] }));
+        const rooms = listData.rooms || [];
+        const roomIds = rooms.map(r => r.roomId).filter(Boolean);
+        
+        // Delete all room Durable Objects
+        for (const roomId of roomIds) {
+          if (!roomId) {
+            console.log('Skipping undefined roomId');
+            continue;
+          }
+          try {
+            const roomObjId = env.GAME_ROOMS.idFromName(roomId);
+            const roomObj = env.GAME_ROOMS.get(roomObjId);
+            await roomObj.fetch(new Request('https://do/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' }
+            }));
+          } catch (e) {
+            console.log('Failed to delete room:', roomId, e);
+          }
+        }
+        
+        // Clear rooms from index
+        await indexObj.fetch(new Request('https://do/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        }));
+        
+        // Clear all queues
+        await indexObj.fetch(new Request('https://do/clearQueue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        }));
+        
+        return new Response(JSON.stringify({ 
+          ok: true, 
+          message: `All rooms cleared (${roomIds.length} rooms) and all queues cleared` 
+        }), { 
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Failed to clear rooms and queues', details: e.message }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/rooms/clear-all') {
       // TESTING ONLY: Clear all rooms and reset index
       if (!env.ROOM_INDEX) {
         return new Response(JSON.stringify({ error: 'no room index' }), { 
@@ -919,6 +1613,7 @@ export default {
       const body = await request.json().catch(() => ({}));
       const playerId = body.playerId;
       const name = body.name || null;
+      const mainTimeMs = body.mainTimeMs || 10 * 60 * 1000; // Default to 10 minutes
       
       if (!env.ROOM_INDEX) {
         return new Response(JSON.stringify({ error: 'no_matchmaking' }), { 
@@ -935,8 +1630,9 @@ export default {
 
       const candidates = rooms.filter(r => 
         r.phase === 'LOBBY' && 
-        r.players < 2 &&
-        !r.private  // Exclude private rooms from quick match
+        (r.players?.length || 0) < 2 &&
+        !r.private &&  // Exclude private rooms from quick match
+        r.mainTimeMs === mainTimeMs  // Match time control
       );
       if (candidates.length === 0) {
         return new Response(JSON.stringify({ error: 'no_lobby_rooms' }), { 
@@ -976,16 +1672,422 @@ export default {
 
       const availableRooms = rooms.filter(r => 
         r.phase === 'LOBBY' && 
-        r.players < 2 &&
+        (r.players?.length || 0) < 2 &&
         !r.private  // Exclude private rooms
       );
       
       return new Response(JSON.stringify({ count: availableRooms.length }), { 
         headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
       });
+    }
+
+    // Queue endpoints
+    if (request.method === 'POST' && url.pathname === '/queue/joinAll') {
+      const body = await request.json().catch(() => ({}));
+      const { playerId, name } = body;
+      
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      // SIMPLIFIED: Join all 3 queues using the working single queue logic
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      const timeControls = [5 * 60 * 1000, 10 * 60 * 1000, 15 * 60 * 1000]; // 5, 10, 15 minutes
+      let matchFound = false;
+      let matchData = null;
+      
+      for (const mainTimeMs of timeControls) {
+        if (matchFound) break;
+        
+        const joinReq = new Request('https://do/addToQueue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            playerId, 
+            name, 
+            mainTimeMs
+          })
+        });
+        
+        const response = await idxObj.fetch(joinReq);
+        const data = await response.json();
+        
+        if (data.shouldCreateRoom && data.queuedPlayers && data.queuedPlayers.length >= 2) {
+          matchFound = true;
+          matchData = { ...data, mainTimeMs };
+          break;
+        }
+      }
+      
+      if (matchFound) {
+        const roomId = `room-${crypto.randomUUID()}`;
+        const roomObjId = env.GAME_ROOMS.idFromName(roomId);
+        const roomObj = env.GAME_ROOMS.get(roomObjId);
+        
+        const initReq = new Request('https://do/initRoom', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            roomId,
+            private: false,
+            mainTimeMs: matchData.mainTimeMs,
+            queuedPlayers: matchData.queuedPlayers
+          })
+        });
+        
+        const initResponse = await roomObj.fetch(initReq);
+        const initResult = await initResponse.json();
+        
+        if (!initResult.ok) {
+          return new Response(JSON.stringify({ 
+            error: 'Room initialization failed', 
+            details: initResult 
+          }), { 
+            status: 500,
+            headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+          });
+        }
+        
+        const playerIdsToRemove = matchData.queuedPlayers.map(p => p.playerId);
+        
+        const removeReq = new Request('https://do/removeFromAllQueues', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            playerIds: playerIdsToRemove 
+          })
+        });
+        
+        await idxObj.fetch(removeReq);
+        
+        return new Response(JSON.stringify({ 
+          ok: true, 
+          roomId, 
+          meta: initResult 
+        }), { 
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        });
+      }
+      
+      return new Response(JSON.stringify({ 
+        ok: true, 
+        queued: true,
+        joinedQueues: [5, 10, 15]
+      }), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/join') {
+      const body = await request.json().catch(() => ({}));
+      const { playerId, name, mainTimeMs } = body;
+      
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      // Add player to queue
+      const queueReq = new Request('https://do/addToQueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId, name, mainTimeMs })
+      });
+      
+      const queueRes = await idxObj.fetch(queueReq);
+      const queueData = await queueRes.json();
+      
+      // Check if we should create a room (2 players in queue)
+      if (queueData.shouldCreateRoom) {
+        // Create room directly using internal method
+        const roomId = `room-${crypto.randomUUID()}`;
+        const objId = env.GAME_ROOMS.idFromName(roomId);
+        const obj = env.GAME_ROOMS.get(objId);
+        
+        const createReq = new Request('https://do/initRoom', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            roomId,
+            private: false, 
+            mainTimeMs: queueData.mainTimeMs,
+            queuedPlayers: queueData.queuedPlayers
+          }),
+        });
+        
+        const createRes = await obj.fetch(createReq);
+        
+        if (createRes.ok) {
+          const createData = await createRes.json();
+          const roomId = createData.roomId || createData.meta?.roomId;
+          
+          // Remove matched players from ALL queues
+          const removeReq = new Request('https://do/removeFromAllQueues', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              playerIds: queueData.queuedPlayers.map(p => p.playerId) 
+            })
+          });
+          await idxObj.fetch(removeReq);
+          
+          return new Response(JSON.stringify({ 
+            ok: true, 
+            roomId,
+            room: createData.room || createData 
+          }), { 
+            headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+          });
+        }
+      }
+      
+      return new Response(JSON.stringify({ 
+        ok: true, 
+        queued: true,
+        queuePosition: queueData.queuePosition 
+      }), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/leave') {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      // Remove player from all queues
+      const leaveReq = new Request('https://do/removeFromAllQueues', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId })
+      });
+      
+      await idxObj.fetch(leaveReq);
+      
+      return new Response(JSON.stringify({ ok: true }), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/clear-all-queues') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), {
+          status: 500,
+          headers: corsHeaders
+        });
       }
 
-      if (segments[0] === 'rooms' && segments[1]) {
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+
+      const clearReq = new Request('https://do/clear-all-queues', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+
+      const response = await idxObj.fetch(clearReq);
+      const data = await response.json();
+
+      return new Response(JSON.stringify(data), {
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders)
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/updateClocks') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), {
+          status: 500,
+          headers: corsHeaders
+        });
+      }
+
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+
+      const updateReq = new Request('https://do/updateClocks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: request.body
+      });
+
+      const data = await idxObj.fetch(updateReq).then(r => r.json());
+      return new Response(JSON.stringify(data), {
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders)
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/debugEstimates') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), {
+          status: 500,
+          headers: corsHeaders
+        });
+      }
+
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+
+      const debugReq = new Request('https://do/debugEstimates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      const data = await idxObj.fetch(debugReq).then(r => r.json());
+      return new Response(JSON.stringify(data), {
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders)
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/debugQueues') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), {
+          status: 500,
+          headers: corsHeaders
+        });
+      }
+
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+
+      const debugReq = new Request('https://do/debugQueues', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      const response = await idxObj.fetch(debugReq);
+      const data = await response.json();
+
+      return new Response(JSON.stringify(data), {
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders)
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/debugRooms') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), {
+          status: 500,
+          headers: corsHeaders
+        });
+      }
+
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+
+      const debugReq = new Request('https://do/debugRooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      const response = await idxObj.fetch(debugReq);
+      const data = await response.json();
+
+      return new Response(JSON.stringify(data), {
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders)
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/checkMatch') {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      const checkReq = new Request('https://do/checkMatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId })
+      });
+      
+      const response = await idxObj.fetch(checkReq);
+      const data = await response.json();
+      
+      return new Response(JSON.stringify(data), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/queue/heartbeat') {
+      const body = await request.json().catch(() => ({}));
+      const { playerId } = body;
+      
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      // Send heartbeat to update player's last activity
+      const heartbeatReq = new Request('https://do/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ playerId })
+      });
+      
+      await idxObj.fetch(heartbeatReq);
+      
+      return new Response(JSON.stringify({ ok: true }), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/queue/status') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      // Get queue status with estimated wait times
+      const statusReq = new Request('https://do/queue-status', {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+      const statusRes = await idxObj.fetch(statusReq);
+      const statusData = await statusRes.json();
+      
+      return new Response(JSON.stringify(statusData), { 
+        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+      });
+    }
+
+    if (segments[0] === 'rooms' && segments[1]) {
         const roomId = segments[1];
         const id = env.GAME_ROOMS.idFromName(roomId);
         const obj = env.GAME_ROOMS.get(id);
@@ -998,47 +2100,110 @@ export default {
         if (segments.length === 3 && segments[2] === 'join' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/joinRoom', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/joinRoom', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'start-bidding' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/startBidding', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/startBidding', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'submit-bid' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/submitBid', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/submitBid', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'choose-color' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/chooseColor', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/chooseColor', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'move' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/makeMove', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/makeMove', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'time-forfeit' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/timeForfeit', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/timeForfeit', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'rematch' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/rematch', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/rematch', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'leave' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/leaveRoom', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/leaveRoom', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
         if (segments.length === 3 && segments[2] === 'heartbeat' && request.method === 'POST') {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
-          return obj.fetch(new Request('https://do/heartbeat', { method: 'POST', headers, body: bodyText }));
+          const response = await obj.fetch(new Request('https://do/heartbeat', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
         }
 
       }
