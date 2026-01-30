@@ -211,7 +211,7 @@ export class GameRoom {
 
   async _handleJoin(request) {
     console.log('🚪 _handleJoin called for room:', this.room?.roomId);
-    if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 30 * 60 * 1000) {
+    if (this.room.updatedAt && (this._now() - this.room.updatedAt) > 5 * 60 * 1000) {
       try {
         if (this.env?.ROOM_INDEX) {
           const indexId = this.env.ROOM_INDEX.idFromName('index');
@@ -467,7 +467,7 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = winnerId;
       this.room.clocks.frozenAt = now; 
-      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchWindowEnds = this._now() + 15 * 1000;
       this.room.rematchVotes = {};
       await this._save();
       return this._response({
@@ -497,7 +497,7 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = playerId;
       this.room.clocks.frozenAt = now;  
-      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchWindowEnds = this._now() + 15 * 1000;
       this.room.rematchVotes = {};
       await this._save();
       return this._response({
@@ -520,7 +520,7 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = null;
       this.room.clocks.frozenAt = now;
-      this.room.rematchWindowEnds = this._now() + 60 * 1000;
+      this.room.rematchWindowEnds = this._now() + 15 * 1000;
       this.room.rematchVotes = {};
       await this._save();
       return this._response({
@@ -599,7 +599,7 @@ export class GameRoom {
     await this._resolveBidsIfNeeded();
     await this._resolveChoiceIfNeeded();
 
-    if (this.room.updatedAt && (now - this.room.updatedAt) > 30 * 60 * 1000) {
+    if (this.room.updatedAt && (now - this.room.updatedAt) > 5 * 60 * 1000) {
       try {
         if (this.env?.ROOM_INDEX) {
           const indexId = this.env.ROOM_INDEX.idFromName('index');
@@ -684,7 +684,8 @@ export class GameRoom {
           }
         } catch (e) {}
         
-        if (yesVotes.length > 0 && !anyNo) {
+        // Auto-requeue yes voters into new game with same time control
+        if (yesVotes.length > 0) {
           for (const yesVoterId of yesVotes) {
             try {
               if (this.env?.ROOM_INDEX) {
@@ -697,6 +698,7 @@ export class GameRoom {
                     phase: 'LOBBY',
                     maxPlayers: 2,
                     private: false,
+                    mainTimeMs: this.room.mainTimeMs,
                     players: this.room.players,
                     updatedAt: now
                   }),
@@ -728,6 +730,7 @@ export class GameRoom {
 
     this.room.rematchVotes = this.room.rematchVotes || {};
     
+    // Lock in vote - no changes allowed
     if (typeof this.room.rematchVotes[playerId] !== 'undefined') {
       return this._response({ error: 'already_voted' }, 400);
     }
@@ -761,13 +764,55 @@ export class GameRoom {
 
     const anyNo = players.some(pid => this.room.rematchVotes[pid] === false);
     if (anyNo) {
+      // Immediate closure on "No" vote - no waiting period
+      try {
+        if (this.env?.ROOM_INDEX) {
+          const indexId = this.env.ROOM_INDEX.idFromName('index');
+          const obj = this.env.ROOM_INDEX.get(indexId);
+          await obj.fetch(new Request('https://do/remove', {
+            method: 'POST',
+            body: JSON.stringify({ roomId: this.room.roomId }),
+            headers: { 'Content-Type': 'application/json' }
+          }));
+        }
+      } catch (e) {}
+      
+      // Auto-requeue yes voters immediately
+      const yesVotes = players.filter(pid => this.room.rematchVotes[pid] === true);
+      if (yesVotes.length > 0) {
+        for (const yesVoterId of yesVotes) {
+          try {
+            if (this.env?.ROOM_INDEX) {
+              const indexId = this.env.ROOM_INDEX.idFromName('index');
+              const obj = this.env.ROOM_INDEX.get(indexId);
+              await obj.fetch(new Request('https://do/update', {
+                method: 'POST',
+                body: JSON.stringify({
+                  roomId: this.room.roomId,
+                  phase: 'LOBBY',
+                  maxPlayers: 2,
+                  private: false,
+                  mainTimeMs: this.room.mainTimeMs,
+                  players: this.room.players,
+                  updatedAt: this._now()
+                }),
+                headers: { 'Content-Type': 'application/json' }
+              }));
+            }
+          } catch (e) {}
+        }
+      }
+      
+      this.room.closed = true;
+      this.room.closeReason = 'declined_rematch';
+      this.room.closedAt = this._now();
+      await this._save();
       return this._response({ ok: true, rematchStarted: false, voteResult: 'no_vote', votes: this.room.rematchVotes });
     }
 
     const yesVotes = players.filter(pid => this.room.rematchVotes[pid] === true);
-    const noVotes = players.filter(pid => this.room.rematchVotes[pid] === false);
     
-    if (yesVotes.length === 1 && noVotes.length === 0) {
+    if (yesVotes.length === 1) {
       return this._response({ ok: true, rematchStarted: false, voteResult: 'waiting_for_opponent', votes: this.room.rematchVotes });
     }
 
