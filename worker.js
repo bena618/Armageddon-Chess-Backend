@@ -855,6 +855,7 @@ export class RoomIndex {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this._sockets = new Set();
   }
 
   async _getAll() {
@@ -864,6 +865,35 @@ export class RoomIndex {
 
   async _saveAll(obj) {
     await this.state.storage.put('rooms', obj);
+  }
+
+  _handleWebSocket(request) {
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+
+    server.accept();
+    this._sockets.add(server);
+
+    server.addEventListener('close', () => {
+      try { this._sockets.delete(server); } catch (e) {}
+    });
+
+    // Send initial queue status
+    this._broadcastQueueStatus();
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  _broadcastQueueStatus() {
+    const msg = JSON.stringify({ 
+      type: 'queue_update',
+      timestamp: Date.now()
+    });
+    for (const ws of this._sockets) {
+      try {
+        if (ws && ws.readyState === 1) ws.send(msg);
+      } catch (e) {}
+    }
   }
 
   async _cleanupStaleQueues(queues) {
@@ -1125,6 +1155,9 @@ export class RoomIndex {
       await this.state.storage.put('queues', queues);
       console.log('💾 Queues saved:', JSON.stringify(queues));
       
+      // Broadcast queue update to all connected clients
+      this._broadcastQueueStatus();
+      
       // Clean up stale players before checking for matches
       await this._cleanupStaleQueues(queues);
       console.log('🧹 After cleanup:', JSON.stringify(queues));
@@ -1255,6 +1288,9 @@ export class RoomIndex {
       }
       
       await this.state.storage.put('queues', queues);
+      
+      // Broadcast queue update to all connected clients
+      this._broadcastQueueStatus();
       
       return new Response(JSON.stringify({ ok: true }), { 
         headers: { 'Content-Type': 'application/json' } 
@@ -1476,6 +1512,10 @@ export class RoomIndex {
       }
       
       await this.state.storage.put('queues', queues);
+      
+      // Broadcast queue update to all connected clients
+      this._broadcastQueueStatus();
+      
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
     
@@ -1490,6 +1530,10 @@ export class RoomIndex {
       }
       
       await this.state.storage.put('queues', queues);
+      
+      // Broadcast queue update to all connected clients
+      this._broadcastQueueStatus();
+      
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
     return new Response(JSON.stringify({ error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
@@ -2108,6 +2152,20 @@ export default {
       return new Response(JSON.stringify({ ok: true }), { 
         headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
       });
+    }
+
+    if (request.url.endsWith('/queue/ws') && request.headers.get('Upgrade') === 'websocket') {
+      if (!env.ROOM_INDEX) {
+        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const idxId = env.ROOM_INDEX.idFromName('index');
+      const idxObj = env.ROOM_INDEX.get(idxId);
+      
+      return idxObj.fetch(request);
     }
 
     if (request.method === 'GET' && url.pathname === '/queue/status') {
