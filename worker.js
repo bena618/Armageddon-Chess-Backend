@@ -485,7 +485,7 @@ export class GameRoom {
     const to = move.slice(2, 4);
     const promotion = move.length >= 5 ? move[4] : undefined;
 
-    const moved = game.move({ from, to, promotion: promotion || 'q' });
+    const moved = game.move({ from, to, promotion });
     if (!moved) return this._response({ error: 'illegal_move' }, 400);
 
     this.room.gameFen = game.fen();
@@ -777,29 +777,32 @@ export class GameRoom {
         }
       } catch (e) {}
       
-      // Auto-requeue yes voters immediately
+      // Auto-requeue yes voters into queue system
       const yesVotes = players.filter(pid => this.room.rematchVotes[pid] === true);
       if (yesVotes.length > 0) {
         for (const yesVoterId of yesVotes) {
           try {
-            if (this.env?.ROOM_INDEX) {
-              const indexId = this.env.ROOM_INDEX.idFromName('index');
-              const obj = this.env.ROOM_INDEX.get(indexId);
-              await obj.fetch(new Request('https://do/update', {
-                method: 'POST',
-                body: JSON.stringify({
-                  roomId: this.room.roomId,
-                  phase: 'LOBBY',
-                  maxPlayers: 2,
-                  private: false,
-                  mainTimeMs: this.room.mainTimeMs,
-                  players: this.room.players,
-                  updatedAt: this._now()
-                }),
-                headers: { 'Content-Type': 'application/json' }
-              }));
+            // Get the player who voted yes
+            const yesPlayer = this.room.players.find(p => p.id === yesVoterId);
+            if (yesPlayer) {
+              // Add to queue with same time control
+              if (this.env?.ROOM_INDEX) {
+                const indexId = this.env.ROOM_INDEX.idFromName('index');
+                const obj = this.env.ROOM_INDEX.get(indexId);
+                await obj.fetch(new Request('https://do/addToQueue', {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    playerId: yesVoterId,
+                    name: yesPlayer.name,
+                    mainTimeMs: this.room.mainTimeMs
+                  }),
+                  headers: { 'Content-Type': 'application/json' }
+                }));
+              }
             }
-          } catch (e) {}
+          } catch (e) {
+            console.error('Failed to requeue yes voter:', e);
+          }
         }
       }
       
@@ -1923,7 +1926,7 @@ export default {
       const leaveReq = new Request('https://do/removeFromAllQueues', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId })
+        body: JSON.stringify({ playerIds: [playerId] })
       });
       
       await idxObj.fetch(leaveReq);
