@@ -127,6 +127,7 @@ export class GameRoom {
       if (path === '/submitBid' && request.method === 'POST') return this._handleSubmitBid(request);
       if (path === '/chooseColor' && request.method === 'POST') return this._handleChooseColor(request);
       if (path === '/makeMove' && request.method === 'POST') return this._handleMakeMove(request);
+      if (path === '/resign' && request.method === 'POST') return this._handleResign(request);
       if (path === '/leaveRoom' && request.method === 'POST') return this._handleLeave(request);
       if (path === '/rematch' && request.method === 'POST') return this._handleRematch(request);
       if (path === '/getState' && request.method === 'GET') return this._handleGetState();
@@ -590,6 +591,43 @@ export class GameRoom {
     if (reason) responseBody.reason = reason;
 
     return this._response(responseBody);
+  }
+
+  async _handleResign(request) {
+    const body = await request.json().catch(() => ({}));
+    const { playerId } = body;
+    
+    if (!playerId) return this._response({ error: 'playerId_required' }, 400);
+    if (this.room.phase !== 'PLAYING') return this._response({ error: 'not_in_playing_phase' }, 400);
+    
+    // Check if the player is actually in the game
+    const player = this.room.players?.find(p => p.id === playerId);
+    if (!player) return this._response({ error: 'player_not_in_game' }, 400);
+    
+    const now = this._now();
+    
+    // Find the opponent (winner)
+    const opponentId = this.room.players?.find(p => p.id !== playerId)?.id || null;
+    
+    // Set game to finished state
+    this.room.phase = 'FINISHED';
+    this.room.winnerId = opponentId;
+    this.room.result = 'resignation';
+    this.room.clocks.frozenAt = now;
+    this.room.rematchWindowEnds = this._now() + 15 * 1000;
+    this.room.rematchVotes = {};
+    
+    await this._save();
+    await this._indexUpdate();
+    
+    return this._response({
+      ok: true,
+      result: 'resignation',
+      winnerId: opponentId,
+      clocks: this.room.clocks,
+      moves: this.room.moves,
+      rematchWindowEnds: this.room.rematchWindowEnds
+    });
   }
 
   async _handleGetState() {
@@ -2243,6 +2281,18 @@ export default {
           const bodyText = await request.clone().text().catch(() => null);
           const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
           const response = await obj.fetch(new Request('https://do/chooseColor', { method: 'POST', headers, body: bodyText }));
+          const responseData = await response.json().catch(() => ({}));
+          return new Response(JSON.stringify(responseData), {
+            status: response.status,
+            headers: Object.assign({}, corsHeaders, {
+              'Content-Type': 'application/json'
+            })
+          });
+        }
+        if (segments.length === 3 && segments[2] === 'resign' && request.method === 'POST') {
+          const bodyText = await request.clone().text().catch(() => null);
+          const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/json' };
+          const response = await obj.fetch(new Request('https://do/resign', { method: 'POST', headers, body: bodyText }));
           const responseData = await response.json().catch(() => ({}));
           return new Response(JSON.stringify(responseData), {
             status: response.status,
