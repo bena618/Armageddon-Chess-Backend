@@ -451,7 +451,7 @@ export class GameRoom {
         this.room.phase = 'FINISHED';
         this.room.winnerId = null;
         this.room.clocks.frozenAt = now;
-        this.room.rematchWindowEnds = this._now() + 10 * 1000;
+        this.room.rematchWindowEnds = this._now() + 30 * 1000;
         this.room.rematchVotes = {};
         await this._save();
         return this._response({
@@ -468,7 +468,7 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = winnerId;
       this.room.clocks.frozenAt = now; 
-      this.room.rematchWindowEnds = this._now() + 15 * 1000;
+      this.room.rematchWindowEnds = this._now() + 30 * 1000;
       this.room.rematchVotes = {};
       await this._save();
       return this._response({
@@ -498,7 +498,7 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = playerId;
       this.room.clocks.frozenAt = now;  
-      this.room.rematchWindowEnds = this._now() + 15 * 1000;
+      this.room.rematchWindowEnds = this._now() + 30 * 1000;
       this.room.rematchVotes = {};
       await this._save();
       return this._response({
@@ -521,7 +521,7 @@ export class GameRoom {
       this.room.phase = 'FINISHED';
       this.room.winnerId = null;
       this.room.clocks.frozenAt = now;
-      this.room.rematchWindowEnds = this._now() + 15 * 1000;
+      this.room.rematchWindowEnds = this._now() + 30 * 1000;
       this.room.rematchVotes = {};
       await this._save();
       return this._response({
@@ -578,7 +578,7 @@ export class GameRoom {
 
     this.room.phase = 'FINISHED';
     this.room.winnerId = winnerId;
-    this.room.rematchWindowEnds = this._now() + 60 * 1000;
+    this.room.rematchWindowEnds = this._now() + 30 * 1000;
     this.room.rematchVotes = {};
     await this._save();
 
@@ -614,7 +614,7 @@ export class GameRoom {
     this.room.winnerId = opponentId;
     this.room.result = 'resignation';
     this.room.clocks.frozenAt = now;
-    this.room.rematchWindowEnds = this._now() + 15 * 1000;
+    this.room.rematchWindowEnds = this._now() + 30 * 1000;
     this.room.rematchVotes = {};
     
     await this._save();
@@ -794,6 +794,7 @@ export class GameRoom {
       this.room.moves = [];
       this.room.choiceAttempts = 0;
       this.room.currentPicker = null;
+      this.room.startRequestedBy = null; // Clear this to allow fresh start
       this.room.rematchWindowEnds = null;
       this.room.rematchVotes = null;
       await this._save();
