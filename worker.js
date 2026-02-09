@@ -10,7 +10,7 @@ export class GameRoom {
 
   _corsHeaders() {
     return {
-      "Access-Control-Allow-Origin": (this.env && this.env.FRONTEND_URL) || "*",
+      "Access-Control-Allow-Origin": (this.env && this.env.FRONTEND_URL) || "http://localhost:3000",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
     };
@@ -885,9 +885,165 @@ export class GameRoom {
       return this._response({ ok: true });
     }
 
+}
 
+export class LobbyCoordinator {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.connections = new Set();
+    this.queueState = {};
+  }
 
+  async fetch(request) {
+    const url = new URL(request.url);
+    
+    if (request.headers.get('Upgrade') === 'websocket') {
+      return this._handleWebSocket(request);
+    }
+    
+    // Handle HTTP fallback for current queue status
+    if (url.pathname === '/status') {
+      const estimates = await this._getEstimatedWaitTimes();
+      return new Response(JSON.stringify({ estimates }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+    
+    // Handle broadcast requests from RoomIndex
+    if (request.method === 'POST' && url.pathname.endsWith('/broadcast')) {
+      const msg = await request.text();
+      
+      // Broadcast to all connected lobby viewers
+      for (const ws of this.connections) {
+        try {
+          if (ws.readyState === 1) ws.send(msg);
+        } catch (e) {
+          // Remove dead connections
+          this.connections.delete(ws);
+        }
+      }
+      
+      return new Response(JSON.stringify({ ok: true }), { 
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    if (request.method === 'POST' && url.pathname.endsWith('/syncQueueState')) {
+      const body = await request.json().catch(() => ({}));
+      const { queueState } = body;
+      
+      if (queueState && typeof queueState === 'object') {
+        this.queueState = { ...this.queueState, ...queueState };
+        await this.state.storage.put('queueState', this.queueState);
+        
+        return new Response(JSON.stringify({ ok: true, queueState: this.queueState }), { 
+          headers: { 'Content-Type': 'application/json' } 
+        });
+      }
+      
+      return new Response(JSON.stringify({ error: 'invalid_queue_state' }), { 
+        status: 400,
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+    
+    return new Response('Not found', { status: 404 });
+  }
 
+  async _saveAll(obj) {
+    await this.state.storage.put('rooms', obj);
+  }
+
+  _handleWebSocket(request) {
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+
+    server.accept();
+    this.connections.add(server);
+
+    server.addEventListener('close', () => {
+      this.connections.delete(server);
+    });
+
+    // Send current state immediately on connect
+    (async () => {
+      try {
+        const estimates = await this._getEstimatedWaitTimes();
+        const msg = JSON.stringify({
+          type: 'queue_status',
+          estimates: estimates,
+          timestamp: Date.now()
+        });
+        if (server.readyState === 1) server.send(msg);
+      } catch (e) {
+        console.log('Error sending initial queue status:', e);
+      }
+    })();
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async updateQueue(timeControl, delta) {
+    const timeKey = timeControl.toString();
+    this.queueState[timeKey] = (this.queueState[timeKey] || 0) + delta;
+    if (this.queueState[timeKey] < 0) this.queueState[timeKey] = 0;
+
+    // Broadcast to all connected lobby viewers
+    const estimates = await this._getEstimatedWaitTimes();
+    const msg = JSON.stringify({
+      type: 'queue_update',
+      estimates: estimates,
+      timestamp: Date.now()
+    });
+
+    for (const ws of this.connections) {
+      try {
+        if (ws.readyState === 1) ws.send(msg);
+      } catch (e) {
+        // Remove dead connections
+        this.connections.delete(ws);
+      }
+    }
+
+    // Persist queue state
+    await this.state.storage.put('queueState', this.queueState);
+  }
+
+  async _getEstimatedWaitTimes() {
+    // Load queue state from storage if not in memory
+    if (Object.keys(this.queueState).length === 0) {
+      this.queueState = await this.state.storage.get('queueState') || {};
+    }
+
+    const estimates = {};
+    
+    for (const timeControl of TIME_CONTROLS) {
+      const timeMs = timeControl.ms;
+      const timeKey = timeMs.toString();
+      const queueLength = this.queueState[timeKey] || 0;
+      
+      let estimateData = {
+        type: 'none',
+        message: 'No players waiting'
+      };
+      
+      if (queueLength >= 1) {
+        estimateData = {
+          type: 'match_now',
+          message: 'Match NOW!'
+        };
+      }
+      
+      estimates[timeKey] = {
+        queueLength,
+        activeGames: 0, // LobbyCoordinator doesn't track active games
+        estimate: estimateData
+      };
+    }
+
+    return estimates;
+  }
 }
 
 export class RoomIndex {
@@ -906,74 +1062,116 @@ export class RoomIndex {
     await this.state.storage.put('rooms', obj);
   }
 
-  _handleWebSocket(request) {
-    const webSocketPair = new WebSocketPair();
-    const [client, server] = Object.values(webSocketPair);
-
-    server.accept();
-    this._sockets.add(server);
-
-    server.addEventListener('close', () => {
-      try { this._sockets.delete(server); } catch (e) {}
-    });
-
-    // Send initial queue status
-    this._broadcastQueueStatus();
-
-    return new Response(null, { status: 101, webSocket: client });
-  }
-
-  _broadcastQueueStatus() {
-    const msg = JSON.stringify({ 
-      type: 'queue_update',
-      timestamp: Date.now()
-    });
-    for (const ws of this._sockets) {
+  async _broadcastQueueStatus() {
+    if (this.env?.LOBBY_COORDINATOR) {
       try {
-        if (ws && ws.readyState === 1) ws.send(msg);
-      } catch (e) {}
-    }
-  }
+        const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+        const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+        const estimates = await this._getEstimatedWaitTimes();
+        const msg = JSON.stringify({
+          type: 'queue_status',
+          estimates: estimates,
+          timestamp: Date.now()
+        });
 
-  async _cleanupStaleQueues(queues) {
-    const now = Date.now();
-    const STALE_TIME = 5 * 60 * 1000;
-    
-    for (const timeKey in queues) {
-      const originalLength = queues[timeKey].length;
-      queues[timeKey] = queues[timeKey].filter(player => {
-        const lastActivity = player.lastHeartbeat || player.joinedAt;
-        return (now - lastActivity) < STALE_TIME;
-      });
-      
-      if (queues[timeKey].length < originalLength) {
-        console.log(`Cleaned ${originalLength - queues[timeKey].length} stale players from ${timeKey}ms queue`);
+        await lobbyObj.fetch(new Request('https://do/broadcast', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: msg
+        }));
+        
+        await this._syncQueueStateToLobbyCoordinator();
+      } catch (e) {
+        console.log('Failed to broadcast queue status:', e);
       }
     }
-    
-    await this.state.storage.put('queues', queues);
+  }
+
+  async _broadcastQueueStatusUpdate(estimates) {
+    if (this.env?.LOBBY_COORDINATOR) {
+      try {
+        const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+        const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+        const msg = JSON.stringify({
+          type: 'queue_update',
+          estimates: estimates,
+          timestamp: Date.now()
+        });
+
+        await lobbyObj.fetch(new Request('https://do/broadcast', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: msg
+        }));
+        
+        await this._syncQueueStateToLobbyCoordinator();
+      } catch (e) {
+        console.log('Failed to broadcast queue status update:', e);
+      }
+    }
+  }
+
+  async _sendPlayerJoinedNotification(playerId, totalInQueue) {
+    // Notify LobbyCoordinator to send player joined notification
+    if (this.env?.LOBBY_COORDINATOR) {
+      try {
+        const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+        const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+        
+        const msg = JSON.stringify({
+          type: 'player_joined',
+          playerId: playerId,
+          totalInQueue: totalInQueue,
+          timestamp: Date.now()
+        });
+
+        // LobbyCoordinator will handle the actual broadcasting
+        await lobbyObj.fetch(new Request('https://do/broadcast', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: msg
+        }));
+      } catch (e) {
+        console.log('Failed to send player joined notification:', e);
+      }
+    }
+  }
+
+  async _syncQueueStateToLobbyCoordinator() {
+    if (this.env?.LOBBY_COORDINATOR) {
+      try {
+        const queues = await this.state.storage.get('queues') || {};
+        const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+        const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+        
+        const queueState = {};
+        for (const timeKey in queues) {
+          queueState[timeKey] = queues[timeKey].length;
+        }
+        
+        await lobbyObj.fetch(new Request('https://do/syncQueueState', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ queueState })
+        }));
+      } catch (e) {
+        console.log('Failed to sync queue state to LobbyCoordinator:', e);
+      }
+    }
   }
 
   async _getEstimatedWaitTimes() {
-    const rooms = await this._getAll();
     const queues = await this.state.storage.get('queues') || {};
     const estimates = {};
-    const now = Date.now();
     
     for (const timeControl of TIME_CONTROLS) {
       const timeMs = timeControl.ms;
       const timeKey = timeMs.toString();
-      const queueLength = queues[timeKey]?.length || 0;
-      
-      const activeGames = Object.values(rooms).filter(room => 
-        room.mainTimeMs === timeMs && 
-        room.phase === 'PLAYING' &&
-        room.players?.length === 2
-      );
+      const queueLength = queues[timeKey] ? queues[timeKey].length : 0;
       
       let estimateData = {
         type: 'none',
-        message: 'No games in place - no available estimate'
+        message: 'No players waiting'
       };
       
       if (queueLength >= 1) {
@@ -981,88 +1179,41 @@ export class RoomIndex {
           type: 'match_now',
           message: 'Match NOW!'
         };
-      } else if (queueLength === 0 && activeGames.length > 0) {
-        // Find game with shortest time remaining
-        let minRemainingTime = Infinity;
-        let shortestGame = null;
-        
-        for (const game of activeGames) {
-          // Try multiple clock field locations, fallback to time-based estimation
-          const whiteTime = game.liveWhiteMs || game.clocks?.whiteRemainingMs || game.whiteTime || 0;
-          const blackTime = game.liveBlackMs || game.clocks?.blackRemainingMs || game.blackTime || 0;
-          
-          let minPlayerTime;
-          if (whiteTime > 0 || blackTime > 0) {
-            // Use actual clock data if available
-            minPlayerTime = Math.min(whiteTime, blackTime);
-          } else {
-            // Without real clock data, we can't accurately estimate chess clock time
-            // Chess clocks are move-based, not elapsed time based
-            // Just show that a game is active
-            minPlayerTime = (game.mainTimeMs || 300000); // Use full time as placeholder
-          }
-          
-          if (minPlayerTime < minRemainingTime) {
-            minRemainingTime = minPlayerTime;
-            shortestGame = game;
-          }
-        }
-        
-        if (minRemainingTime < Infinity && shortestGame) {
-          // Check if we have real clock data or just placeholder
-          const hasRealClockData = (shortestGame.liveWhiteMs || shortestGame.clocks?.whiteRemainingMs || 
-                                   shortestGame.liveBlackMs || shortestGame.clocks?.blackRemainingMs || 0) > 0;
-          
-          if (hasRealClockData) {
-            // Use real clock data for countdown
-            const anchorKey = `estimate_anchor_${timeKey}`;
-            const anchorData = await this.state.storage.get(anchorKey);
-            
-            if (!anchorData || anchorData.gameId !== shortestGame.roomId) {
-              // Create new anchor
-              const newAnchor = {
-                gameId: shortestGame.roomId,
-                startTime: now,
-                durationMs: minRemainingTime,
-                timeControlMs: timeMs
-              };
-              await this.state.storage.put(anchorKey, newAnchor);
-              
-              estimateData = {
-                type: 'countdown',
-                startTime: now,
-                durationMs: minRemainingTime,
-                message: `Next game in ~${Math.ceil(minRemainingTime / 60000)} min`
-              };
-            } else {
-              // Use existing anchor - countdown continues
-              const elapsed = now - anchorData.startTime;
-              const remaining = Math.max(0, anchorData.durationMs - elapsed);
-              
-              estimateData = {
-                type: 'countdown',
-                startTime: anchorData.startTime,
-                durationMs: anchorData.durationMs,
-                message: `Next game in ~${Math.ceil(remaining / 60000)} min`
-              };
-            }
-          } else {
-            estimateData = {
-              type: 'games_active',
-              message: `${activeGames.length} game${activeGames.length > 1 ? 's' : ''} in progress`
-            };
-          }
-        }
       }
       
       estimates[timeKey] = {
         queueLength,
-        activeGames: activeGames.length,
+        activeGames: 0,
         estimate: estimateData
       };
     }
-    
+
     return estimates;
+  }
+
+  async _cleanupStaleQueues(queues) {
+    const now = Date.now();
+    const STALE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    
+    for (const timeKey in queues) {
+      const originalLength = queues[timeKey].length;
+      queues[timeKey] = queues[timeKey].filter(player => {
+        return (now - player.lastHeartbeat) < STALE_TIMEOUT;
+      });
+      
+      const removedCount = originalLength - queues[timeKey].length;
+      if (removedCount > 0) {
+        if (this.env?.LOBBY_COORDINATOR) {
+          try {
+            const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+            const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+            await lobbyObj.updateQueue(parseInt(timeKey), -removedCount);
+          } catch (e) {
+            console.log('Failed to notify LobbyCoordinator of cleanup:', e);
+          }
+        }
+      }
+    }
   }
 
   async fetch(request) {
@@ -1070,11 +1221,11 @@ export class RoomIndex {
       const body = await request.json().catch(() => ({}));
       const rooms = await this._getAll();
       const existingRoom = rooms[body.roomId] || {};
-      
-      rooms[body.roomId] = { 
+
+      rooms[body.roomId] = {
         ...existingRoom,
-        roomId: body.roomId, 
-        phase: body.phase, 
+        roomId: body.roomId,
+        phase: body.phase,
         players: body.players !== undefined ? body.players : (existingRoom.players || []),
         updatedAt: body.updatedAt || Date.now(),
         clocks: body.clocks,
@@ -1082,10 +1233,11 @@ export class RoomIndex {
         liveWhiteMs: body.liveWhiteMs,
         liveBlackMs: body.liveBlackMs
       };
-      
+
       await this._saveAll(rooms);
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
+
     if (request.method === 'POST' && request.url.endsWith('/remove')) {
       const body = await request.json().catch(() => ({}));
       const rooms = await this._getAll();
@@ -1093,30 +1245,30 @@ export class RoomIndex {
       await this._saveAll(rooms);
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
+
     if (request.method === 'POST' && request.url.endsWith('/clear')) {
       await this._saveAll({});
       return new Response(JSON.stringify({ ok: true, message: 'All rooms cleared from index' }), { headers: { 'Content-Type': 'application/json' } });
     }
+
     if (request.method === 'GET' && request.url.endsWith('/list')) {
       const rooms = await this._getAll();
       const list = Object.values(rooms).filter(r => r.phase !== 'FINISHED');
       return new Response(JSON.stringify({ ok: true, rooms: list }), { headers: { 'Content-Type': 'application/json' } });
     }
-    
+
     if (request.method === 'POST' && request.url.endsWith('/joinAll')) {
       const body = await request.json().catch(() => ({}));
       const { playerId, name } = body;
       
       const queues = await this.state.storage.get('queues') || {};
       
-      // Add player to all time control queues (don't remove from existing)
       for (const timeControl of TIME_CONTROLS) {
         const timeKey = timeControl.ms.toString();
         if (!queues[timeKey]) {
           queues[timeKey] = [];
         }
         
-        // Check if player already in this queue
         const alreadyInQueue = queues[timeKey].some(p => p.playerId === playerId);
         if (!alreadyInQueue) {
           queues[timeKey].push({ 
@@ -1125,8 +1277,17 @@ export class RoomIndex {
             joinedAt: Date.now(), 
             lastHeartbeat: Date.now() 
           });
+          
+          if (this.env?.LOBBY_COORDINATOR) {
+            try {
+              const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+              const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+              await lobbyObj.updateQueue(timeControl.ms, 1);
+            } catch (e) {
+              console.log('Failed to notify LobbyCoordinator:', e);
+            }
+          }
         } else {
-          // Update heartbeat if already in queue
           const player = queues[timeKey].find(p => p.playerId === playerId);
           if (player) {
             player.lastHeartbeat = Date.now();
@@ -1135,18 +1296,12 @@ export class RoomIndex {
       }
       
       await this.state.storage.put('queues', queues);
-      
-      // Clean up stale players before checking for matches
       await this._cleanupStaleQueues(queues);
       
-      // Check if any queue has 2 players to create a room
-      console.log('🔍 Checking all queues for matches after joinAll...');
       for (const timeControl of TIME_CONTROLS) {
         const timeKey = timeControl.ms.toString();
-        console.log(`📊 Queue ${timeKey}: ${queues[timeKey].length} players`);
         if (queues[timeKey].length >= 2) {
           const queuedPlayers = queues[timeKey].slice(0, 2);
-          console.log('🏠 Found match in joinAll:', queuedPlayers);
           return new Response(JSON.stringify({ 
             shouldCreateRoom: true, 
             mainTimeMs: timeControl.ms, 
@@ -1166,45 +1321,47 @@ export class RoomIndex {
       const body = await request.json().catch(() => ({}));
       const { playerId, name, mainTimeMs } = body;
       
-      console.log('🎯 addToQueue called:', { playerId, name, mainTimeMs });
-      
       const queues = await this.state.storage.get('queues') || {};
       const timeKey = mainTimeMs.toString();
-      
-      console.log('📊 Current queues before:', JSON.stringify(queues));
       
       if (!queues[timeKey]) {
         queues[timeKey] = [];
       }
       
-      // Check if player already in this queue
       const alreadyInQueue = queues[timeKey].some(p => p.playerId === playerId);
       if (!alreadyInQueue) {
         queues[timeKey].push({ playerId, name, joinedAt: Date.now(), lastHeartbeat: Date.now() });
-        console.log('➕ Player added to queue:', timeKey);
+        
+        if (this.env?.LOBBY_COORDINATOR) {
+          try {
+            const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+            const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+            await lobbyObj.updateQueue(mainTimeMs, 1);
+          } catch (e) {
+            console.log('Failed to notify LobbyCoordinator:', e);
+          }
+        }
       } else {
-        // Update heartbeat if already in queue
         const player = queues[timeKey].find(p => p.playerId === playerId);
         if (player) {
           player.lastHeartbeat = Date.now();
-          console.log('💓 Player heartbeat updated:', timeKey);
         }
       }
       
       await this.state.storage.put('queues', queues);
-      console.log('💾 Queues saved:', JSON.stringify(queues));
-      
-      // Broadcast queue update to all connected clients
+      await this._syncQueueStateToLobbyCoordinator();
       this._broadcastQueueStatus();
       
-      // Clean up stale players before checking for matches
-      await this._cleanupStaleQueues(queues);
-      console.log('🧹 After cleanup:', JSON.stringify(queues));
+      const totalInQueue = Object.values(queues).reduce((sum, queue) => sum + queue.length, 0);
+      this._sendPlayerJoinedNotification(playerId, totalInQueue);
       
-      // Check if we have 2 players to create a room
+      const estimates = await this._getEstimatedWaitTimes();
+      this._broadcastQueueStatusUpdate(estimates);
+      
+      await this._cleanupStaleQueues(queues);
+      
       if (queues[timeKey].length >= 2) {
         const queuedPlayers = queues[timeKey].slice(0, 2);
-        console.log('🏠 Creating room with players:', queuedPlayers);
         return new Response(JSON.stringify({ 
           shouldCreateRoom: true, 
           mainTimeMs, 
@@ -1212,7 +1369,6 @@ export class RoomIndex {
         }), { headers: { 'Content-Type': 'application/json' } });
       }
       
-      console.log('⏳ Player queued, position:', queues[timeKey].findIndex(p => p.playerId === playerId) + 1);
       return new Response(JSON.stringify({ 
         ok: true, 
         queued: true, 
@@ -1222,10 +1378,25 @@ export class RoomIndex {
     
     if (request.method === 'POST' && request.url.endsWith('/debugQueues')) {
       const queues = await this.state.storage.get('queues') || {};
-      console.log('🔍 Debug: All queues:', JSON.stringify(queues, null, 2));
+      
+      let lobbyQueueState = null;
+      if (this.env?.LOBBY_COORDINATOR) {
+        try {
+          const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+          const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+          const statusRes = await lobbyObj.fetch(new Request('https://do/status'));
+          const statusData = await statusRes.json();
+          lobbyQueueState = statusData;
+        } catch (e) {
+          console.log('Failed to get LobbyCoordinator status:', e);
+        }
+      }
+      
       return new Response(JSON.stringify({ 
-        queues,
-        totalQueued: Object.values(queues).reduce((sum, queue) => sum + queue.length, 0)
+        roomIndexQueues: queues,
+        lobbyCoordinatorEstimates: lobbyQueueState,
+        totalQueued: Object.values(queues).reduce((sum, queue) => sum + queue.length, 0),
+        syncStatus: lobbyQueueState ? 'checked' : 'failed'
       }), { headers: { 'Content-Type': 'application/json' } });
     }
     
@@ -1298,7 +1469,6 @@ export class RoomIndex {
         if (player) {
           player.lastHeartbeat = Date.now();
           found = true;
-          break;
         }
       }
       
@@ -1322,43 +1492,44 @@ export class RoomIndex {
       
       const queues = await this.state.storage.get('queues') || {};
       
+      // Track which time controls had players removed for notifications
+      const affectedTimeControls = new Set();
+      
       for (const timeKey in queues) {
+        const beforeCount = queues[timeKey].length;
         queues[timeKey] = queues[timeKey].filter(p => !playerIds.includes(p.playerId));
+        const afterCount = queues[timeKey].length;
+        
+        if (beforeCount > afterCount) {
+          // Find the time control for this queue
+          const timeControl = TIME_CONTROLS.find(tc => tc.ms.toString() === timeKey);
+          if (timeControl) {
+            affectedTimeControls.add(timeControl.ms);
+          }
+        }
       }
       
       await this.state.storage.put('queues', queues);
       
-      // Broadcast queue update to all connected clients
-      this._broadcastQueueStatus();
+      // CRITICAL FIX: Sync queue state to LobbyCoordinator immediately after removal
+      await this._syncQueueStateToLobbyCoordinator();
       
-      return new Response(JSON.stringify({ ok: true }), { 
-        headers: { 'Content-Type': 'application/json' } 
-      });
-    }
-    
-    if (request.method === 'POST' && request.url.endsWith('/updateClocks')) {
-      const body = await request.json().catch(() => ({}));
-      const { roomId, clocks } = body;
-      
-      if (!roomId || !clocks) {
-        return new Response(JSON.stringify({ error: 'roomId_and_clocks_required' }), { 
-          status: 400, 
-          headers: { 'Content-Type': 'application/json' } 
-        });
+      // Notify LobbyCoordinator of queue changes
+      for (const timeControlMs of affectedTimeControls) {
+        if (this.env?.LOBBY_COORDINATOR) {
+          try {
+            const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+            const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+            const removedCount = playerIds.length;
+            await lobbyObj.updateQueue(timeControlMs, -removedCount);
+          } catch (e) {
+            console.log('Failed to notify LobbyCoordinator:', e);
+          }
+        }
       }
       
-      const rooms = await this._getAll();
-      const existingRoom = rooms[roomId] || {};
-      
-      // Update the room with clock data
-      rooms[roomId] = { 
-        ...existingRoom,
-        roomId,
-        clocks,
-        updatedAt: Date.now()
-      };
-      
-      await this._putAll(rooms);
+      // Broadcast queue update to all connected clients
+      this._broadcastQueueStatus();
       
       return new Response(JSON.stringify({ ok: true }), { 
         headers: { 'Content-Type': 'application/json' } 
@@ -1420,6 +1591,7 @@ export class RoomIndex {
           roomId: roomId
         };
       }
+      
       for (const [roomId, room] of Object.entries(rooms)) {
         if (room.phase === 'PLAYING' && room.players?.length === 2) {
           const timeKey = room.mainTimeMs?.toString();
@@ -1575,6 +1747,38 @@ export class RoomIndex {
       
       return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
     }
+    
+    if (request.method === 'POST' && request.url.endsWith('/sendMatchNotification')) {
+      const body = await request.json().catch(() => ({}));
+      const { playerIds, roomId } = body;
+      
+      if (this.env?.LOBBY_COORDINATOR) {
+        try {
+          const lobbyId = this.env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+          const lobbyObj = this.env.LOBBY_COORDINATOR.get(lobbyId);
+          
+          const msg = JSON.stringify({
+            type: 'matched',
+            playerIds: playerIds,
+            roomId: roomId,
+            timestamp: Date.now()
+          });
+
+          await lobbyObj.fetch(new Request('https://do/broadcast', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: msg
+          }));
+        } catch (e) {
+          console.log('Failed to send match notification:', e);
+        }
+      }
+      
+      return new Response(JSON.stringify({ ok: true }), { 
+        headers: { 'Content-Type': 'application/json' } 
+      });
+    }
+    
     return new Response(JSON.stringify({ error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 }
@@ -1594,99 +1798,74 @@ export default {
     const url = new URL(request.url);
     const segments = url.pathname.replace(/(^\/|\/$)/g, '').split('/');
     const corsHeaders = {
-      'Access-Control-Allow-Origin': env && env.FRONTEND_URL ? env.FRONTEND_URL : '*',
+      'Access-Control-Allow-Origin': env && env.FRONTEND_URL ? env.FRONTEND_URL : 'http://localhost:3000',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     };
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders });
 
-    try {
-      if (request.method === 'POST' && url.pathname === '/rooms/clear-all-and-queues') {
-      // TESTING ONLY: Clear all rooms, reset index, and clear all queues
-      if (!env.ROOM_INDEX) {
-        return new Response(JSON.stringify({ error: 'no room index' }), { 
+    // Handle WebSocket connections first - they need special routing
+    if (url.pathname === '/queue/ws' && request.headers.get('Upgrade') === 'websocket') {
+      if (!env.LOBBY_COORDINATOR) {
+        return new Response(JSON.stringify({ error: 'no_lobby_coordinator' }), { 
           status: 500, 
           headers: corsHeaders 
         });
       }
       
-      try {
-        // Get room IDs from the index instead of listing Durable Objects
-        const indexId = env.ROOM_INDEX.idFromName('index');
-        const indexObj = env.ROOM_INDEX.get(indexId);
-        
-        // Get all rooms from index
-        const listRes = await indexObj.fetch(new Request('https://do/list', {
-          method: 'GET',
-          headers: { 'Content-Type': 'application/json' }
-        }));
-        const listData = await listRes.json().catch(() => ({ rooms: [] }));
-        const rooms = listData.rooms || [];
-        const roomIds = rooms.map(r => r.roomId).filter(Boolean);
-        
-        // Delete all room Durable Objects
-        for (const roomId of roomIds) {
-          if (!roomId) {
-            console.log('Skipping undefined roomId');
-            continue;
-          }
-          try {
-            const roomObjId = env.GAME_ROOMS.idFromName(roomId);
-            const roomObj = env.GAME_ROOMS.get(roomObjId);
-            await roomObj.fetch(new Request('https://do/delete', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' }
-            }));
-          } catch (e) {
-            console.log('Failed to delete room:', roomId, e);
-          }
-        }
-        
-        // Clear rooms from index
-        await indexObj.fetch(new Request('https://do/clear', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' }
-        }));
-        
-        // Clear all queues
-        await indexObj.fetch(new Request('https://do/clearQueue', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({})
-        }));
-        
-        return new Response(JSON.stringify({ 
-          ok: true, 
-          message: `All rooms cleared (${roomIds.length} rooms) and all queues cleared` 
-        }), { 
-          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: 'Failed to clear rooms and queues', details: e.message }), { 
-          status: 500, 
-          headers: corsHeaders 
-        });
-      }
+      const lobbyId = env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+      const lobbyObj = env.LOBBY_COORDINATOR.get(lobbyId);
+      
+      return lobbyObj.fetch(request);
     }
 
-    if (request.method === 'POST' && url.pathname === '/rooms/clear-all') {
-      // TESTING ONLY: Clear all rooms and reset index
-      if (!env.ROOM_INDEX) {
-        return new Response(JSON.stringify({ error: 'no room index' }), { 
+    // Handle lobby WebSocket connections for real-time queue updates
+    if (url.pathname === '/lobby/ws' && request.headers.get('Upgrade') === 'websocket') {
+      if (!env.LOBBY_COORDINATOR) {
+        return new Response(JSON.stringify({ error: 'no_lobby_coordinator' }), { 
           status: 500, 
           headers: corsHeaders 
         });
       }
       
-      try {
-        // Get all rooms from index
+      const lobbyId = env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+      const lobbyObj = env.LOBBY_COORDINATOR.get(lobbyId);
+      
+      return lobbyObj.fetch(request);
+    }
+
+    // Handle HTTP fallback for lobby status
+    if (url.pathname === '/lobby/status') {
+      if (!env.LOBBY_COORDINATOR) {
+        return new Response(JSON.stringify({ error: 'no_lobby_coordinator' }), { 
+          status: 500, 
+          headers: corsHeaders 
+        });
+      }
+      
+      const lobbyId = env.LOBBY_COORDINATOR.idFromName('public-lobby-coordinator');
+      const lobbyObj = env.LOBBY_COORDINATOR.get(lobbyId);
+      
+      return lobbyObj.fetch(request);
+    }
+
+    try {
+      if (request.method === 'POST' && url.pathname === '/rooms/clear-all-and-queues') {
+        // TESTING ONLY: Clear all rooms, reset index, and clear all queues
+        if (!env.ROOM_INDEX) {
+          return new Response(JSON.stringify({ error: 'no room index' }), { 
+            status: 500, 
+            headers: corsHeaders 
+          });
+        }
+        
+        // Delete each room's Durable Object storage
         const indexId = env.ROOM_INDEX.idFromName('index');
         const indexObj = env.ROOM_INDEX.get(indexId);
         const listRes = await indexObj.fetch(new Request('https://do/list'));
         const listData = await listRes.json().catch(() => ({ rooms: [] }));
         const rooms = listData.rooms || [];
         
-        // Delete each room's Durable Object storage
         for (const room of rooms) {
           try {
             const roomId = room.roomId;
@@ -1707,15 +1886,22 @@ export default {
           headers: { 'Content-Type': 'application/json' }
         }));
         
-        return new Response(JSON.stringify({ ok: true, message: `All rooms cleared (${rooms.length} rooms deleted)` }), { 
+        // Clear all queues
+        const queues = await this.state.storage.get('queues') || {};
+        for (const timeKey in queues) {
+          queues[timeKey] = [];
+        }
+        await this.state.storage.put('queues', queues);
+        
+        return new Response(JSON.stringify({ ok: true, message: `All rooms and queues cleared (${rooms.length} rooms deleted)` }), { 
           headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
         });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: 'Failed to clear rooms', details: e.message }), { 
-          status: 500, 
-          headers: corsHeaders 
-        });
       }
+    } catch (e) {
+      return new Response(JSON.stringify({ error: 'Failed to clear rooms and queues', details: e.message }), { 
+        status: 500, 
+        headers: corsHeaders 
+      });
     }
 
     if (request.method === 'POST' && url.pathname === '/rooms') {
@@ -1915,80 +2101,102 @@ export default {
     }
 
     if (request.method === 'POST' && url.pathname === '/queue/join') {
-      const body = await request.json().catch(() => ({}));
-      const { playerId, name, mainTimeMs } = body;
-      
-      if (!env.ROOM_INDEX) {
-        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
-          status: 500, 
-          headers: corsHeaders 
-        });
-      }
-      
-      const idxId = env.ROOM_INDEX.idFromName('index');
-      const idxObj = env.ROOM_INDEX.get(idxId);
-      
-      // Add player to queue
-      const queueReq = new Request('https://do/addToQueue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playerId, name, mainTimeMs })
-      });
-      
-      const queueRes = await idxObj.fetch(queueReq);
-      const queueData = await queueRes.json();
-      
-      // Check if we should create a room (2 players in queue)
-      if (queueData.shouldCreateRoom) {
-        // Create room directly using internal method
-        const roomId = `room-${crypto.randomUUID()}`;
-        const objId = env.GAME_ROOMS.idFromName(roomId);
-        const obj = env.GAME_ROOMS.get(objId);
+      try {
+        const body = await request.json().catch(() => ({}));
+        const { playerId, name, mainTimeMs } = body;
         
-        const createReq = new Request('https://do/initRoom', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            roomId,
-            private: false, 
-            mainTimeMs: queueData.mainTimeMs,
-            queuedPlayers: queueData.queuedPlayers
-          }),
-        });
-        
-        const createRes = await obj.fetch(createReq);
-        
-        if (createRes.ok) {
-          const createData = await createRes.json();
-          const roomId = createData.roomId || createData.meta?.roomId;
-          
-          // Remove matched players from ALL queues
-          const removeReq = new Request('https://do/removeFromAllQueues', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              playerIds: queueData.queuedPlayers.map(p => p.playerId) 
-            })
-          });
-          await idxObj.fetch(removeReq);
-          
-          return new Response(JSON.stringify({ 
-            ok: true, 
-            roomId,
-            room: createData.room || createData 
-          }), { 
-            headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        if (!env.ROOM_INDEX) {
+          return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
+            status: 500, 
+            headers: corsHeaders 
           });
         }
+        
+        const idxId = env.ROOM_INDEX.idFromName('index');
+        const idxObj = env.ROOM_INDEX.get(idxId);
+        
+        // Add player to queue
+        const queueReq = new Request('https://do/addToQueue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId, name, mainTimeMs })
+        });
+        
+        const queueRes = await idxObj.fetch(queueReq);
+        const queueData = await queueRes.json();
+        
+        // Check if we should create a room (2 players in queue)
+        if (queueData.shouldCreateRoom) {
+          // Create room directly using internal method
+          const roomId = `room-${crypto.randomUUID()}`;
+          const objId = env.GAME_ROOMS.idFromName(roomId);
+          const obj = env.GAME_ROOMS.get(objId);
+          
+          const createReq = new Request('https://do/initRoom', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              roomId,
+              private: false, 
+              mainTimeMs: queueData.mainTimeMs,
+              queuedPlayers: queueData.queuedPlayers
+            })
+          });
+          
+          const createRes = await obj.fetch(createReq);
+          const createData = await createRes.json();
+          
+          if (createRes.ok) {
+            const roomId = createData.roomId || createData.meta?.roomId;
+            
+            // Send match notifications to both players via WebSocket
+            const matchNotificationReq = new Request('https://do/sendMatchNotification', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                playerIds: queueData.queuedPlayers.map(p => p.playerId),
+                roomId: roomId
+              })
+            });
+            await idxObj.fetch(matchNotificationReq);
+            
+            // Remove matched players from ALL queues
+            const removeReq = new Request('https://do/removeFromAllQueues', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                playerIds: queueData.queuedPlayers.map(p => p.playerId) 
+              })
+            });
+            await idxObj.fetch(removeReq);
+            
+            return new Response(JSON.stringify({ 
+              ok: true, 
+              roomId,
+              room: createData.room || createData 
+            }), { 
+              headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+            });
+          }
+        }
+        
+        return new Response(JSON.stringify({ 
+          ok: true, 
+          queued: true,
+          queuePosition: queueData.queuePosition 
+        }), { 
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        });
+      } catch (error) {
+        console.error('Queue join error:', error);
+        return new Response(JSON.stringify({ 
+          error: 'Failed to join queue', 
+          details: error.message 
+        }), { 
+          status: 500,
+          headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
+        });
       }
-      
-      return new Response(JSON.stringify({ 
-        ok: true, 
-        queued: true,
-        queuePosition: queueData.queuePosition 
-      }), { 
-        headers: Object.assign({ 'Content-Type': 'application/json' }, corsHeaders) 
-      });
     }
 
     if (request.method === 'POST' && url.pathname === '/queue/leave') {
@@ -2193,20 +2401,6 @@ export default {
       });
     }
 
-    if (request.url.endsWith('/queue/ws') && request.headers.get('Upgrade') === 'websocket') {
-      if (!env.ROOM_INDEX) {
-        return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
-          status: 500, 
-          headers: corsHeaders 
-        });
-      }
-      
-      const idxId = env.ROOM_INDEX.idFromName('index');
-      const idxObj = env.ROOM_INDEX.get(idxId);
-      
-      return idxObj.fetch(request);
-    }
-
     if (request.method === 'GET' && url.pathname === '/queue/status') {
       if (!env.ROOM_INDEX) {
         return new Response(JSON.stringify({ error: 'no_queue_system' }), { 
@@ -2365,8 +2559,5 @@ export default {
 
       }
       return new Response(JSON.stringify({ error: 'route_not_found' }), { status: 404, headers: corsHeaders });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err?.message || String(err) }), { status: 500, headers: corsHeaders });
-    }
   }
 };
